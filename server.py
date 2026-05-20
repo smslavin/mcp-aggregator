@@ -149,7 +149,7 @@ async def main() -> None:
     app = build_starlette_app(server)
     port = int(os.environ.get("AGGREGATOR_PORT", 8100))
 
-    config = uvicorn.Config(app, host="::", port=port, log_level="info")
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     userver = uvicorn.Server(config)
     logger.info("Starting aggregator on port %d", port)
     await userver.serve()
