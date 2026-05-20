@@ -83,7 +83,7 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
 
 def build_starlette_app(server: Server) -> Starlette:
     # --- Streamable HTTP transport (Claude Desktop, modern clients) ---
-    session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
+    session_manager = StreamableHTTPSessionManager(app=server, stateless=False)
     streamable_app = StreamableHTTPASGIApp(session_manager)
 
     # --- Legacy SSE transport (older clients, custom chat UIs) ---
