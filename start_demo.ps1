@@ -8,10 +8,10 @@ $venv = "$dir\.venv\Scripts\python.exe"
 function Stop-PortProcess($port) {
     $hits = netstat -ano | Select-String "[:.]$port\s+\S+\s+LISTENING"
     foreach ($line in $hits) {
-        $pid = ($line.ToString().Trim() -split '\s+')[-1]
-        if ($pid -match '^\d+$' -and $pid -ne '0') {
-            Write-Host "  Stopping PID $pid on port $port"
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+        $portPid = ($line.ToString().Trim() -split '\s+')[-1]
+        if ($portPid -match '^\d+$' -and $portPid -ne '0') {
+            Write-Host "  Stopping PID $portPid on port $port"
+            Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
         }
     }
 }
