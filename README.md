@@ -27,15 +27,23 @@ calls the tool, and returns the result. The aggregator adds no parsing or transf
 
 ## Setup
 
+**Windows (PowerShell)**
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
+**macOS / Linux**
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
 ## Running
 
-Start all backends first, then the aggregator:
+Start all backends first, then the aggregator.
 
+**Windows (PowerShell)**
 ```powershell
 # Terminal 1 — mock plant backend (demo, no AVEVA required)
 .venv\Scripts\python mock_backend.py
@@ -45,6 +53,29 @@ cd ..\opcua-mcp && .venv\Scripts\python server.py
 
 # Terminal 3 — aggregator
 .venv\Scripts\python server.py
+```
+
+**macOS / Linux**
+```bash
+# Terminal 1 — mock plant backend (demo, no AVEVA required)
+.venv/bin/python mock_backend.py
+
+# Terminal 2 — opcua-mcp (optional, needs OPC-UA simulator or server)
+cd ../opcua-mcp && .venv/bin/python server.py
+
+# Terminal 3 — aggregator
+.venv/bin/python server.py
+```
+
+Or use the launcher scripts:
+
+```powershell
+# Windows
+.\start_demo.ps1
+```
+```bash
+# macOS / Linux
+./start_demo.sh
 ```
 
 The aggregator runs on port 8100 by default. Set `AGGREGATOR_PORT` in `.env` to change.
