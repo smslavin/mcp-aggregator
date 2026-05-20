@@ -5,6 +5,22 @@
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venv = "$dir\.venv\Scripts\python.exe"
 
+function Stop-PortProcess($port) {
+    $hits = netstat -ano | Select-String "[:.]$port\s+\S+\s+LISTENING"
+    foreach ($line in $hits) {
+        $pid = ($line.ToString().Trim() -split '\s+')[-1]
+        if ($pid -match '^\d+$' -and $pid -ne '0') {
+            Write-Host "  Stopping PID $pid on port $port"
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Write-Host "Clearing ports 8003 and 8100..."
+Stop-PortProcess 8003
+Stop-PortProcess 8100
+Start-Sleep -Seconds 1
+
 Write-Host "Starting mock plant backend on port 8003..."
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "& '$venv' '$dir\mock_backend.py'" -WorkingDirectory $dir
 
