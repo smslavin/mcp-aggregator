@@ -15,6 +15,29 @@ AI Client (Claude Desktop / Chat UI)
     opcua-mcp            mock-backend (or any FastMCP server)
 ```
 
+## Tool namespacing
+
+Tools are prefixed `{backend_name}__{tool_name}`. With backends named `opcua` and
+`plant`, the aggregated namespace looks like:
+
+```
+opcua__connect_server
+opcua__browse_nodes
+opcua__read_node
+...
+plant__get_plant_status
+plant__list_sensors
+plant__acknowledge_alarm
+...
+```
+
+The prefix is stripped before forwarding to the backend, so backend servers receive
+the original tool name unchanged.
+
+In environments with multiple data sources — OPCUA, MQTT, SCADA configuration — namespacing 
+prevents tool name collisions and makes the audit log immediately readable. 
+Every tool call identifies both the domain and the operation.
+
 ## How it works
 
 **Startup:** for each backend in `backends.json`, opens an SSE session and calls
@@ -106,22 +129,3 @@ is logged. The aggregator still starts with whatever tools it could discover.
 ```
 
 One entry. All tools from all backends.
-
-## Tool namespacing
-
-Tools are prefixed `{backend_name}__{tool_name}`. With backends named `opcua` and
-`plant`, the aggregated namespace looks like:
-
-```
-opcua__connect_server
-opcua__browse_nodes
-opcua__read_node
-...
-plant__get_plant_status
-plant__list_sensors
-plant__acknowledge_alarm
-...
-```
-
-The prefix is stripped before forwarding to the backend, so backend servers receive
-the original tool name unchanged.
