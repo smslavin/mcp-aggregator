@@ -10,24 +10,27 @@ AI Client (Claude Desktop / Chat UI)
     ├── startup: discover tools from all backends
     ├── runtime: route + proxy tool calls
     └── cross-cutting: logging, error isolation
-         │                    │
-    SSE :8002            SSE :8003
-    opcua-mcp            mock-backend (or any FastMCP server)
+         │               │               │
+    SSE :8000       SSE :8001       SSE :8002
+    graccess-mcp    mqtt-mcp        opcua-mcp
+    (or any FastMCP server)
 ```
 
 ## Tool namespacing
 
-Tools are prefixed `{backend_name}__{tool_name}`. With backends named `opcua` and
-`plant`, the aggregated namespace looks like:
+Tools are prefixed `{backend_name}__{tool_name}`. With backends named `graccess`,
+`mqtt`, and `opcua`, the aggregated namespace looks like:
 
 ```
-opcua__connect_server
+graccess__connect_galaxy
+graccess__list_galaxies
+graccess__set_attribute
+...
+mqtt__list_topics
+mqtt__read_topic_value
+...
 opcua__browse_nodes
 opcua__read_node
-...
-plant__get_plant_status
-plant__list_sensors
-plant__acknowledge_alarm
 ...
 ```
 
@@ -40,7 +43,7 @@ Every tool call identifies both the domain and the operation.
 
 ## How it works
 
-**Startup:** for each backend in `backends.json`, opens an SSE session and calls
+**Startup:** for each backend in the configured backends file (see below), opens an SSE session and calls
 `tools/list`. Every discovered tool is registered with a `{backend}__{tool}` prefix so
 the routing is explicit and collision-free.
 
@@ -104,10 +107,13 @@ chmod +x start_demo.sh
 
 The aggregator runs on port 8100 by default. Set `AGGREGATOR_PORT` in `.env` to change.
 
-## backends.json
+## backends.json / backends.production.json
 
-Edit to add or remove backends. The aggregator reads this at startup.
+The aggregator reads a JSON file listing backend servers at startup. By default it reads
+`backends.json`. Set the `BACKENDS_FILE` environment variable to use a different file
+(relative to the script directory, or absolute path).
 
+**`backends.json`** — demo config (mock plant backend, no AVEVA required):
 ```json
 [
   { "name": "opcua", "url": "http://localhost:8002/sse" },
@@ -115,8 +121,39 @@ Edit to add or remove backends. The aggregator reads this at startup.
 ]
 ```
 
+**`backends.production.json`** — production config (full graccess-mcp stack):
+```json
+[
+  { "name": "graccess", "url": "http://127.0.0.1:8000/sse" },
+  { "name": "mqtt",     "url": "http://127.0.0.1:8001/sse" },
+  { "name": "opcua",    "url": "http://127.0.0.1:8002/sse" }
+]
+```
+
 If a backend is unreachable at startup, its tools are silently skipped and a warning
 is logged. The aggregator still starts with whatever tools it could discover.
+
+## Running as a Windows service
+
+The aggregator can run as an auto-start Windows service via [NSSM](https://nssm.cc/download).
+Start the three backend MCP servers before starting the aggregator — tool discovery runs at
+startup and backends that are unreachable at that point will not have their tools registered.
+
+```powershell
+# Install (run as Administrator)
+.\install_service.ps1
+
+# Remove
+.\uninstall_service.ps1
+```
+
+`install_service.ps1` defaults to `backends.production.json`. Edit the `$BackendsFile`
+variable at the top of the script to use a different config. The service is installed as
+`AVEVA Demo McpAggregator` on port 8100.
+
+When using the full graccess-mcp stack, the coordinated `install_services.ps1` in the
+graccess-mcp repo installs all seven services (backends, aggregator, chat UI) in the
+correct order with service dependencies wired automatically.
 
 ## Claude Desktop config
 
