@@ -1,0 +1,4 @@
+[
+  { "name": "opcua", "url": "http://localhost:8002/sse" },
+  { "name": "plant", "url": "http://localhost:8003/sse" }
+]
