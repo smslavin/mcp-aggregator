@@ -10,10 +10,9 @@ AI Client (Claude Desktop / Chat UI)
     ├── startup: discover tools from all backends
     ├── runtime: route + proxy tool calls
     └── cross-cutting: logging, error isolation
-         │               │               │
-    SSE :8000       SSE :8001       SSE :8002
-    graccess-mcp    mqtt-mcp        opcua-mcp
-    (or any FastMCP server)
+         │                    │
+    SSE :8002            SSE :8003
+    opcua-mcp            mock-backend (or any FastMCP server)
 ```
 
 ## Tool namespacing
