@@ -74,7 +74,8 @@ Or use the launcher scripts:
 .\start_demo.ps1
 ```
 ```bash
-# macOS / Linux
+# macOS / Linux (make executable once, then run)
+chmod +x start_demo.sh
 ./start_demo.sh
 ```
 
