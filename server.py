@@ -136,7 +136,11 @@ def build_starlette_app(server: Server) -> Starlette:
 
 
 async def main() -> None:
-    backends_path = os.path.join(os.path.dirname(__file__), "backends.json")
+    backends_file = os.environ.get("BACKENDS_FILE", "backends.json")
+    backends_path = (
+        backends_file if os.path.isabs(backends_file)
+        else os.path.join(os.path.dirname(__file__), backends_file)
+    )
     with open(backends_path) as f:
         backends = json.load(f)
 
