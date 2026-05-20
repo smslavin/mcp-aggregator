@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import uvicorn
 from dotenv import load_dotenv
 from mcp import ClientSession, types
@@ -168,13 +169,19 @@ async def main() -> None:
                 isError=True,
             )
 
-    app = build_starlette_app(server)
-    port = int(os.environ.get("AGGREGATOR_PORT", 8100))
+    if "--stdio" in sys.argv:
+        from mcp.server.stdio import stdio_server
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    userver = uvicorn.Server(config)
-    logger.info("Starting aggregator on port %d", port)
-    await userver.serve()
+        logger.info("Starting in stdio mode")
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+    else:
+        app = build_starlette_app(server)
+        port = int(os.environ.get("AGGREGATOR_PORT", 8100))
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+        userver = uvicorn.Server(config)
+        logger.info("Starting aggregator on port %d", port)
+        await userver.serve()
 
 
 if __name__ == "__main__":

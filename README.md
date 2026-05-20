@@ -120,19 +120,37 @@ is logged. The aggregator still starts with whatever tools it could discover.
 
 ## Claude Desktop config
 
+Claude Desktop requires HTTPS for URL-based remote connectors and rejects plain HTTP
+entries at config validation. The workaround is [`mcp-remote`](https://www.npmjs.com/package/mcp-remote),
+a lightweight npm bridge that runs as a local stdio subprocess and connects to the
+aggregator over HTTP internally.
+
+**Prerequisite:** Node.js on the client machine (`winget install OpenJS.NodeJS` or
+[nodejs.org](https://nodejs.org)).
+
+Add to `%APPDATA%\Claude\claude_desktop_config.json`:
+
 ```json
 {
   "mcpServers": {
-    "scada": { "url": "http://localhost:8100/mcp" }
+    "scada": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://<aggregator-host>:8100/mcp", "--allow-http"]
+    }
   }
 }
 ```
 
-One entry. All tools from all backends.
+Replace `<aggregator-host>` with the IP or hostname of the machine running the aggregator
+(e.g. `192.168.80.134`). Use `localhost` if Claude Desktop and the aggregator are on the
+same machine.
+
+The `--allow-http` flag is required because `mcp-remote` also enforces HTTPS by default
+for non-localhost URLs.
 
 The aggregator serves two transports on the same port:
 
 | Path | Transport | Use for |
 |---|---|---|
-| `/mcp` | Streamable HTTP | Claude Desktop, modern MCP clients |
+| `/mcp` | Streamable HTTP | Claude Desktop (via mcp-remote), modern MCP clients |
 | `/sse` | Legacy SSE | Older clients, custom chat UIs |
