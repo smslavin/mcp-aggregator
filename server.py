@@ -102,7 +102,28 @@ def build_starlette_app(server: Server) -> Starlette:
         async with session_manager.run():
             yield
 
-    return Starlette(
+    async def fix_accept_header(scope, receive, send):
+        """Inject Accept: text/event-stream on GET /mcp when the client omits it.
+
+        Claude Desktop sends a GET to open the notification stream but may not
+        include the required Accept header, causing a 406. We patch it here so
+        the StreamableHTTP handler sees the correct value.
+        """
+        if (
+            scope.get("type") == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path") == "/mcp"
+        ):
+            headers = list(scope.get("headers", []))
+            accept_vals = [v for k, v in headers if k == b"accept"]
+            if not accept_vals or b"text/event-stream" not in accept_vals[0]:
+                logger.info("Injecting Accept: text/event-stream for GET /mcp")
+                headers = [(k, v) for k, v in headers if k != b"accept"]
+                headers.append((b"accept", b"text/event-stream"))
+                scope = dict(scope, headers=headers)
+        await starlette_inner(scope, receive, send)
+
+    starlette_inner = Starlette(
         lifespan=lifespan,
         routes=[
             Route("/mcp", endpoint=streamable_app, methods=["GET", "POST", "DELETE"]),
@@ -110,6 +131,7 @@ def build_starlette_app(server: Server) -> Starlette:
             Mount("/messages/", app=sse.handle_post_message),
         ],
     )
+    return fix_accept_header
 
 
 async def main() -> None:
