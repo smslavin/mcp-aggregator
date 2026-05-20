@@ -1,4 +1,4 @@
-"""MCP Aggregator — single SSE endpoint that proxies multiple backend MCP servers.
+"""MCP Aggregator — single endpoint that proxies multiple backend MCP servers.
 
 Startup: reads backends.json, connects to each backend via SSE, calls tools/list,
 prefixes every tool as {backend_name}__{tool_name}, then serves them all from one
@@ -6,19 +6,24 @@ endpoint on port 8100.
 
 Runtime: each tool call opens a fresh SSE session to the originating backend,
 forwards the call, and streams the result back.
+
+Serves two transports on the same port:
+  GET/POST /mcp  — Streamable HTTP (Claude Desktop, modern MCP clients)
+  GET      /sse  — Legacy SSE (older clients, custom chat UIs)
 """
 
 import asyncio
 import json
 import logging
 import os
-
 import uvicorn
 from dotenv import load_dotenv
 from mcp import ClientSession, types
 from mcp.client.sse import sse_client
 from mcp.server import Server
+from mcp.server.fastmcp.server import StreamableHTTPASGIApp
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
@@ -77,6 +82,11 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
 
 
 def build_starlette_app(server: Server) -> Starlette:
+    # --- Streamable HTTP transport (Claude Desktop, modern clients) ---
+    session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
+    streamable_app = StreamableHTTPASGIApp(session_manager)
+
+    # --- Legacy SSE transport (older clients, custom chat UIs) ---
     sse = SseServerTransport("/messages/")
 
     async def handle_sse(request: Request) -> Response:
@@ -88,11 +98,17 @@ def build_starlette_app(server: Server) -> Starlette:
             )
         return Response()
 
+    async def lifespan(app):
+        async with session_manager.run():
+            yield
+
     return Starlette(
+        lifespan=lifespan,
         routes=[
+            Route("/mcp", endpoint=streamable_app, methods=["GET", "POST", "DELETE"]),
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Mount("/messages/", app=sse.handle_post_message),
-        ]
+        ],
     )
 
 

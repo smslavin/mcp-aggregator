@@ -1,6 +1,6 @@
 # mcp-aggregator
 
-Single SSE endpoint that aggregates multiple backend MCP servers into one unified tool namespace.
+Single endpoint that aggregates multiple backend MCP servers into one unified tool namespace.
 
 ```
 AI Client (Claude Desktop / Chat UI)
@@ -34,7 +34,7 @@ plant__acknowledge_alarm
 The prefix is stripped before forwarding to the backend, so backend servers receive
 the original tool name unchanged.
 
-In environments with multiple data sources — OPCUA, MQTT, SCADA configuration — namespacing 
+In environments with multiple data sources — OPC-UA, MQTT, SCADA configuration — namespacing 
 prevents tool name collisions and makes the audit log immediately readable. 
 Every tool call identifies both the domain and the operation.
 
@@ -123,9 +123,16 @@ is logged. The aggregator still starts with whatever tools it could discover.
 ```json
 {
   "mcpServers": {
-    "scada": { "url": "http://localhost:8100/sse" }
+    "scada": { "url": "http://localhost:8100/mcp" }
   }
 }
 ```
 
 One entry. All tools from all backends.
+
+The aggregator serves two transports on the same port:
+
+| Path | Transport | Use for |
+|---|---|---|
+| `/mcp` | Streamable HTTP | Claude Desktop, modern MCP clients |
+| `/sse` | Legacy SSE | Older clients, custom chat UIs |
