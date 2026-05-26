@@ -40,13 +40,14 @@ Every tool call identifies both the domain and the operation.
 
 ## How it works
 
-**Startup:** for each backend in `backends.json`, opens an SSE session and calls
+**Startup:** for each backend in `backends.json`, connects to the backend and calls
 `tools/list`. Every discovered tool is registered with a `{backend}__{tool}` prefix so
-the routing is explicit and collision-free.
+the routing is explicit and collision-free. Streamable HTTP backends also start a
+persistent pooled session at this point.
 
-**Runtime:** each tool call opens a fresh SSE session to the originating backend,
-calls the tool, and returns the result. The aggregator adds no parsing or transformation
-— it is a transparent proxy.
+**Runtime:** each tool call is routed to the originating backend. Streamable HTTP
+backends use the persistent pooled session; SSE backends open a fresh connection per
+call. The aggregator adds no parsing or transformation — it is a transparent proxy.
 
 ## Setup
 
