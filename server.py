@@ -38,19 +38,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp-aggregator")
 
-# Populated at startup. prefixed_name -> (backend_url, original_tool_name)
-_tool_registry: dict[str, tuple[str, str]] = {}
+# Populated at startup. prefixed_name -> (backend_url, original_tool_name, default_args)
+_tool_registry: dict[str, tuple[str, str, dict]] = {}
 _tool_list: list[types.Tool] = []
 
 
-async def _discover_backend(name: str, url: str) -> int:
+async def _discover_backend(backend: dict) -> int:
+    name = backend["name"]
+    url = backend["url"]
+
+    include = set(backend.get("include_tools") or [])
+    exclude = set(backend.get("exclude_tools") or [])
+    if include and exclude:
+        raise ValueError(
+            f"Backend '{name}': include_tools and exclude_tools are mutually exclusive"
+        )
+
+    default_args: dict = backend.get("default_args") or {}
+
     async with sse_client(url, timeout=10) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
+            registered = 0
             for tool in result.tools:
+                if include and tool.name not in include:
+                    continue
+                if exclude and tool.name in exclude:
+                    continue
                 prefixed = f"{name}__{tool.name}"
-                _tool_registry[prefixed] = (url, tool.name)
+                _tool_registry[prefixed] = (url, tool.name, default_args)
                 _tool_list.append(
                     types.Tool(
                         name=prefixed,
@@ -59,7 +76,8 @@ async def _discover_backend(name: str, url: str) -> int:
                     )
                 )
                 logger.info("  registered: %s", prefixed)
-            return len(result.tools)
+                registered += 1
+            return registered
 
 
 async def discover_all(backends: list[dict]) -> None:
@@ -68,18 +86,21 @@ async def discover_all(backends: list[dict]) -> None:
         url = backend["url"]
         logger.info("Discovering tools from '%s' at %s", name, url)
         try:
-            count = await _discover_backend(name, url)
+            count = await _discover_backend(backend)
             logger.info("  %d tool(s) from '%s'", count, name)
+        except ValueError:
+            raise
         except Exception as e:
             logger.error("Failed to reach backend '%s' (%s): %s", name, url, e)
 
 
 async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResult:
-    url, original_name = _tool_registry[prefixed_name]
+    url, original_name, default_args = _tool_registry[prefixed_name]
+    merged = {**default_args, **arguments}
     async with sse_client(url, timeout=5, sse_read_timeout=60) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            return await session.call_tool(original_name, arguments)
+            return await session.call_tool(original_name, merged)
 
 
 def build_starlette_app(server: Server) -> Starlette:

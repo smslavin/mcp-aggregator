@@ -121,6 +121,52 @@ configs without modifying `backends.json`.
 If a backend is unreachable at startup, its tools are silently skipped and a warning
 is logged. The aggregator still starts with whatever tools it could discover.
 
+### Tool filtering
+
+Use `include_tools` or `exclude_tools` to control which tools are exposed from a
+backend. Filtering happens at discovery time — filtered tools never appear in the
+aggregated namespace. The two fields are mutually exclusive; using both on the same
+backend is an error.
+
+```json
+[
+  {
+    "name": "influxdb",
+    "url": "http://localhost:8003/sse",
+    "include_tools": ["query", "list_measurements"]
+  },
+  {
+    "name": "opcua",
+    "url": "http://localhost:8002/sse",
+    "exclude_tools": ["dangerous_write_tool"]
+  }
+]
+```
+
+### Default arguments
+
+Use `default_args` to inject argument defaults into every tool call forwarded to a
+backend. Caller-supplied arguments always take precedence over defaults. This is useful
+for scoping a backend to a specific context — for example, pointing two MQTT backends
+at the same server but restricting each to a different topic namespace:
+
+```json
+[
+  {
+    "name": "mqtt_rawwater",
+    "url": "http://localhost:8001/sse",
+    "include_tools": ["read_topic_value", "scan_topics"],
+    "default_args": { "topic_filter": "Plant/WTP/Pump/RawWater_*" }
+  },
+  {
+    "name": "mqtt_treated",
+    "url": "http://localhost:8001/sse",
+    "include_tools": ["read_topic_value", "scan_topics"],
+    "default_args": { "topic_filter": "Plant/WTP/Pump/Treated_*" }
+  }
+]
+```
+
 ## Running as a Windows service
 
 The aggregator can run as an auto-start Windows service via [NSSM](https://nssm.cc/download).
