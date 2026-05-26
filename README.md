@@ -167,6 +167,57 @@ at the same server but restricting each to a different topic namespace:
 ]
 ```
 
+### Streamable HTTP backends
+
+Backends that serve the newer Streamable HTTP transport can be declared with
+`"transport": "streamable_http"`. The default is `"sse"` if the field is absent.
+
+```json
+[
+  { "name": "opcua", "url": "http://localhost:8002/sse" },
+  { "name": "analytics", "url": "http://localhost:8004/mcp", "transport": "streamable_http" }
+]
+```
+
+Streamable HTTP backends benefit from connection pooling — the aggregator keeps one
+persistent `ClientSession` open per backend and routes all calls through it. SSE
+backends still open a fresh connection per call.
+
+## Management API
+
+The aggregator exposes a runtime management API for adding and removing backends
+without restarting. All endpoints are unauthenticated.
+
+> **OT environment note:** In a live operational technology environment, expose the
+> management API only on a trusted network interface or behind a reverse proxy with
+> access controls. Unauthenticated `POST /backends` allows any caller to register
+> an arbitrary backend server.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/backends` | List active backends, tool counts, pool status |
+| `POST` | `/backends` | Add a backend (same JSON shape as a backends.json entry) |
+| `DELETE` | `/backends/{name}` | Remove a backend and deregister its tools |
+| `POST` | `/backends/reload` | Re-read backends.json, add new entries, remove gone ones |
+
+**Note:** MCP clients (including Claude Desktop) call `tools/list` once at connect
+time and cache the result. Adding or removing a backend takes effect for new client
+connections but won't be visible to already-connected clients until they reconnect.
+
+### Example: add a backend at runtime
+
+```bash
+curl -X POST http://localhost:8100/backends \
+  -H "Content-Type: application/json" \
+  -d '{"name": "historian", "url": "http://192.168.1.50:8005/sse"}'
+```
+
+### Example: reload from backends.json
+
+```bash
+curl -X POST http://localhost:8100/backends/reload
+```
+
 ## Running as a Windows service
 
 The aggregator can run as an auto-start Windows service via [NSSM](https://nssm.cc/download).
