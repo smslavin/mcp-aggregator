@@ -63,6 +63,13 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+## Running tests
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python3 -m pytest tests/ -v
+```
+
 ## Running
 
 Start all backends first, then the aggregator.
@@ -183,6 +190,26 @@ Backends that serve the newer Streamable HTTP transport can be declared with
 Streamable HTTP backends benefit from connection pooling — the aggregator keeps one
 persistent `ClientSession` open per backend and routes all calls through it. SSE
 backends still open a fresh connection per call.
+
+### Stdio backends
+
+Backends that are local subprocesses speaking MCP over stdio (e.g. the Rust
+`fieldworks-adapters` binaries — `mqtt-mcp`, `opcua-mcp`) are declared with
+`"transport": "stdio"` and `command`/`args` (and optionally `env`) instead of a `url`:
+
+```json
+[
+  { "name": "mqtt", "transport": "stdio", "command": "mqtt-mcp", "args": ["--broker", "localhost:1883"] },
+  { "name": "opcua", "transport": "stdio", "command": "/opt/fieldworks/opcua-mcp", "args": [] }
+]
+```
+
+The aggregator spawns the subprocess and keeps it running for the aggregator's
+lifetime — like Streamable HTTP, stdio backends use the persistent connection pool
+rather than spawning a fresh process per call, since many adapters expose an explicit
+`connect` tool that establishes state later calls depend on. If the pool session isn't
+ready yet (or drops), a call falls back to briefly spawning its own subprocess for that
+one call, then the pool reconnects on its own.
 
 ## Management API
 

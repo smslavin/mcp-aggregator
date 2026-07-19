@@ -5,8 +5,9 @@ prefixes every tool as {backend_name}__{tool_name}, then serves them all from on
 endpoint on port 8100.
 
 Runtime: each tool call is routed to the originating backend. Streamable HTTP
-backends use a persistent pooled session; SSE backends open a fresh connection
-per call.
+and stdio backends use a persistent pooled session (stdio subprocesses can't be
+respawned per call — a "connect" tool call establishes state later calls depend
+on); SSE backends open a fresh connection per call.
 
 Serves two transports on the same port:
   GET/POST /mcp  — Streamable HTTP (Claude Desktop, modern MCP clients)
@@ -30,6 +31,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 from mcp import ClientSession, types
 from mcp.client.sse import sse_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server import Server
 from mcp.server.fastmcp.server import StreamableHTTPASGIApp
@@ -52,33 +54,54 @@ logger = logging.getLogger("mcp-aggregator")
 @dataclass
 class BackendEntry:
     backend_name: str
-    url: str
     original_name: str
     default_args: dict
-    transport: str  # "sse" | "streamable_http"
+    transport: str  # "sse" | "streamable_http" | "stdio"
+    url: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
 
 
 _tool_registry: dict[str, BackendEntry] = {}
 _tool_list: list[types.Tool] = []
-_backends: dict[str, dict] = {}        # name -> raw config, for management API
+_backends: dict[str, dict] = {}  # name -> raw config, for management API
 _registry_lock = asyncio.Lock()
-_session_pool: dict[str, ClientSession] = {}   # HTTP backends only
+_session_pool: dict[str, ClientSession] = {}  # pooled (streamable_http, stdio) backends
 _pool_tasks: dict[str, asyncio.Task] = {}
 _shutdown_event = asyncio.Event()
-_backends_path: str = ""               # set in main(), used by reload endpoint
+_backends_path: str = ""  # set in main(), used by reload endpoint
 
 
 # ---------------------------------------------------------------------------
 # Transport abstraction
 # ---------------------------------------------------------------------------
 
+
 @asynccontextmanager
-async def _make_client(url: str, transport: str, timeout: float = 10, read_timeout: float = 60):
+async def _make_client(
+    transport: str,
+    url: str | None = None,
+    command: str | None = None,
+    args: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float = 10,
+    read_timeout: float = 60,
+):
     if transport == "streamable_http":
-        async with streamablehttp_client(url, timeout=timeout, sse_read_timeout=read_timeout) as (read, write, _):
+        async with streamablehttp_client(
+            url, timeout=timeout, sse_read_timeout=read_timeout
+        ) as (read, write, _):
+            yield read, write
+    elif transport == "stdio":
+        params = StdioServerParameters(command=command, args=args or [], env=env)
+        async with stdio_client(params) as (read, write):
             yield read, write
     else:
-        async with sse_client(url, timeout=timeout, sse_read_timeout=read_timeout) as (read, write):
+        async with sse_client(url, timeout=timeout, sse_read_timeout=read_timeout) as (
+            read,
+            write,
+        ):
             yield read, write
 
 
@@ -86,10 +109,20 @@ async def _make_client(url: str, transport: str, timeout: float = 10, read_timeo
 # Discovery
 # ---------------------------------------------------------------------------
 
+
+def _backend_desc(backend: dict) -> str:
+    if backend.get("transport") == "stdio":
+        return " ".join([backend.get("command", "")] + (backend.get("args") or []))
+    return backend.get("url", "")
+
+
 async def _discover_backend(backend: dict) -> int:
     name = backend["name"]
-    url = backend["url"]
     transport = backend.get("transport", "sse")
+    url = backend.get("url")
+    command = backend.get("command")
+    args = backend.get("args")
+    env = backend.get("env")
 
     include = set(backend.get("include_tools") or [])
     exclude = set(backend.get("exclude_tools") or [])
@@ -100,7 +133,9 @@ async def _discover_backend(backend: dict) -> int:
 
     default_args: dict = backend.get("default_args") or {}
 
-    async with _make_client(url, transport, timeout=10) as (read, write):
+    async with _make_client(
+        transport, url=url, command=command, args=args, env=env, timeout=10
+    ) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -115,10 +150,13 @@ async def _discover_backend(backend: dict) -> int:
                     prefixed = f"{name}__{tool.name}"
                     _tool_registry[prefixed] = BackendEntry(
                         backend_name=name,
-                        url=url,
                         original_name=tool.name,
                         default_args=default_args,
                         transport=transport,
+                        url=url,
+                        command=command,
+                        args=args,
+                        env=env,
                     )
                     _tool_list.append(
                         types.Tool(
@@ -135,47 +173,64 @@ async def _discover_backend(backend: dict) -> int:
 async def discover_all(backends: list[dict]) -> None:
     for backend in backends:
         name = backend["name"]
-        url = backend["url"]
-        logger.info("Discovering tools from '%s' at %s", name, url)
+        desc = _backend_desc(backend)
+        logger.info("Discovering tools from '%s' at %s", name, desc)
         try:
             count = await _discover_backend(backend)
             logger.info("  %d tool(s) from '%s'", count, name)
         except ValueError:
             raise
         except Exception as e:
-            logger.error("Failed to reach backend '%s' (%s): %s", name, url, e)
+            logger.error("Failed to reach backend '%s' (%s): %s", name, desc, e)
 
 
 # ---------------------------------------------------------------------------
-# Connection pool (Streamable HTTP backends only)
+# Connection pool (Streamable HTTP and stdio backends — anything that needs
+# connection state preserved across calls)
 #
 # TODO: Research connection pooling for SSE backends. SSE requires a
 # long-running read loop, so a persistent session likely needs a per-backend
 # asyncio.Queue to serialize calls onto the single open stream.
 # ---------------------------------------------------------------------------
 
-async def _run_http_pool(name: str, url: str) -> None:
-    """Keep one persistent ClientSession open for a Streamable HTTP backend.
+_POOLED_TRANSPORTS = ("streamable_http", "stdio")
 
-    Reconnects automatically on drop. Exits cleanly when _shutdown_event fires.
+
+async def _run_persistent_pool(name: str, backend: dict) -> None:
+    """Keep one persistent ClientSession open for a backend that needs
+    connection state preserved across calls (Streamable HTTP, stdio).
+
+    Reconnects automatically on drop (HTTP) or respawns the subprocess
+    (stdio). Exits cleanly when _shutdown_event fires.
     """
+    transport = backend.get("transport", "sse")
     backoff = 2.0
     while True:
         try:
-            async with streamablehttp_client(url) as (read, write, _):
+            async with _make_client(
+                transport,
+                url=backend.get("url"),
+                command=backend.get("command"),
+                args=backend.get("args"),
+                env=backend.get("env"),
+            ) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     _session_pool[name] = session
-                    logger.info("HTTP pool ready: '%s'", name)
+                    logger.info("Pool ready: '%s' (%s)", name, transport)
                     await _shutdown_event.wait()
                     return
         except asyncio.CancelledError:
             return
         except Exception as e:
             _session_pool.pop(name, None)
-            logger.warning("HTTP pool '%s' dropped, reconnecting in %.0fs: %s", name, backoff, e)
+            logger.warning(
+                "Pool '%s' dropped, reconnecting in %.0fs: %s", name, backoff, e
+            )
             try:
-                await asyncio.wait_for(asyncio.shield(_shutdown_event.wait()), timeout=backoff)
+                await asyncio.wait_for(
+                    asyncio.shield(_shutdown_event.wait()), timeout=backoff
+                )
                 return
             except asyncio.TimeoutError:
                 pass
@@ -183,15 +238,16 @@ async def _run_http_pool(name: str, url: str) -> None:
 
 async def _start_pool_tasks(backends: list[dict]) -> None:
     for backend in backends:
-        if backend.get("transport") == "streamable_http":
+        if backend.get("transport") in _POOLED_TRANSPORTS:
             name = backend["name"]
-            task = asyncio.create_task(_run_http_pool(name, backend["url"]))
+            task = asyncio.create_task(_run_persistent_pool(name, backend))
             _pool_tasks[name] = task
 
 
 # ---------------------------------------------------------------------------
 # Proxy
 # ---------------------------------------------------------------------------
+
 
 async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResult:
     entry = _tool_registry[prefixed_name]
@@ -201,8 +257,16 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
     if session is not None:
         return await session.call_tool(entry.original_name, merged)
 
-    # SSE backends, or HTTP backends whose pool session isn't ready yet
-    async with _make_client(entry.url, entry.transport, timeout=5, read_timeout=60) as (read, write):
+    # SSE backends, or pooled backends whose pool session isn't ready yet
+    async with _make_client(
+        entry.transport,
+        url=entry.url,
+        command=entry.command,
+        args=entry.args,
+        env=entry.env,
+        timeout=5,
+        read_timeout=60,
+    ) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             return await session.call_tool(entry.original_name, merged)
@@ -211,6 +275,7 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
 # ---------------------------------------------------------------------------
 # Management API handlers
 # ---------------------------------------------------------------------------
+
 
 async def _remove_backend(name: str) -> int:
     async with _registry_lock:
@@ -242,6 +307,7 @@ async def handle_backends(request: Request) -> JSONResponse:
                 {
                     "name": name,
                     "url": cfg.get("url"),
+                    "command": cfg.get("command"),
                     "transport": cfg.get("transport", "sse"),
                     "tools": counts.get(name, 0),
                     "pooled": name in _session_pool,
@@ -260,7 +326,10 @@ async def handle_backends(request: Request) -> JSONResponse:
     if not name:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if name in _backends:
-        return JSONResponse({"error": f"Backend '{name}' already exists — remove it first"}, status_code=409)
+        return JSONResponse(
+            {"error": f"Backend '{name}' already exists — remove it first"},
+            status_code=409,
+        )
 
     try:
         count = await _discover_backend(body)
@@ -269,8 +338,8 @@ async def handle_backends(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": f"Discovery failed: {e}"}, status_code=502)
 
-    if body.get("transport") == "streamable_http":
-        task = asyncio.create_task(_run_http_pool(name, body["url"]))
+    if body.get("transport") in _POOLED_TRANSPORTS:
+        task = asyncio.create_task(_run_persistent_pool(name, body))
         _pool_tasks[name] = task
 
     logger.info("Management: added backend '%s' (%d tools)", name, count)
@@ -295,7 +364,9 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
         with open(_backends_path) as f:
             new_backends = json.load(f)
     except Exception as e:
-        return JSONResponse({"error": f"Could not read backends file: {e}"}, status_code=500)
+        return JSONResponse(
+            {"error": f"Could not read backends file: {e}"}, status_code=500
+        )
 
     new_names = {b["name"] for b in new_backends}
     old_names = set(_backends.keys())
@@ -312,19 +383,28 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
             try:
                 count = await _discover_backend(backend)
                 added_total += count
-                if backend.get("transport") == "streamable_http":
-                    task = asyncio.create_task(_run_http_pool(backend["name"], backend["url"]))
+                if backend.get("transport") in _POOLED_TRANSPORTS:
+                    task = asyncio.create_task(
+                        _run_persistent_pool(backend["name"], backend)
+                    )
                     _pool_tasks[backend["name"]] = task
-                logger.info("Management: reload added backend '%s' (%d tools)", backend["name"], count)
+                logger.info(
+                    "Management: reload added backend '%s' (%d tools)",
+                    backend["name"],
+                    count,
+                )
             except Exception as e:
                 errors.append({"backend": backend["name"], "error": str(e)})
 
-    return JSONResponse({"added_tools": added_total, "removed_tools": removed_total, "errors": errors})
+    return JSONResponse(
+        {"added_tools": added_total, "removed_tools": removed_total, "errors": errors}
+    )
 
 
 # ---------------------------------------------------------------------------
 # Starlette app
 # ---------------------------------------------------------------------------
+
 
 def build_starlette_app(server: Server) -> Starlette:
     # --- Streamable HTTP transport (Claude Desktop, modern clients) ---
@@ -378,8 +458,12 @@ def build_starlette_app(server: Server) -> Starlette:
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Mount("/messages/", app=sse.handle_post_message),
             # Management API — /backends/reload must come before /backends/{name}
-            Route("/backends/reload", endpoint=handle_reload_backends, methods=["POST"]),
-            Route("/backends/{name}", endpoint=handle_remove_backend, methods=["DELETE"]),
+            Route(
+                "/backends/reload", endpoint=handle_reload_backends, methods=["POST"]
+            ),
+            Route(
+                "/backends/{name}", endpoint=handle_remove_backend, methods=["DELETE"]
+            ),
             Route("/backends", endpoint=handle_backends, methods=["GET", "POST"]),
         ],
     )
@@ -390,12 +474,14 @@ def build_starlette_app(server: Server) -> Starlette:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 async def main() -> None:
     global _backends_path
 
     backends_file = os.environ.get("BACKENDS_FILE", "backends.json")
     _backends_path = (
-        backends_file if os.path.isabs(backends_file)
+        backends_file
+        if os.path.isabs(backends_file)
         else os.path.join(os.path.dirname(__file__), backends_file)
     )
     with open(_backends_path) as f:
