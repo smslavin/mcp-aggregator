@@ -73,8 +73,3 @@ async def test_stdio_persistent_pool_reuses_subprocess():
             await task
         except asyncio.CancelledError:
             pass
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
