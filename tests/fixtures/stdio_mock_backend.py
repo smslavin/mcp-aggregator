@@ -3,9 +3,9 @@
 Spawned as a subprocess by tests, never run directly by a human.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
-mcp = FastMCP("stdio-mock-backend")
+mcp = MCPServer("stdio-mock-backend")
 
 
 @mcp.tool()

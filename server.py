@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sys
+import httpx2
 import uvicorn
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,11 +33,13 @@ from dotenv import load_dotenv
 from mcp import ClientSession, types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server import Server
-from mcp.server.fastmcp.server import StreamableHTTPASGIApp
 from mcp.server.sse import SseServerTransport
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.streamable_http_manager import (
+    StreamableHTTPASGIApp,
+    StreamableHTTPSessionManager,
+)
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -89,10 +92,25 @@ async def _make_client(
     read_timeout: float = 60,
 ):
     if transport == "streamable_http":
-        async with streamablehttp_client(
-            url, timeout=timeout, sse_read_timeout=read_timeout
-        ) as (read, write, _):
-            yield read, write
+        # streamable_http_client dropped its own timeout kwargs in mcp 2.0 —
+        # it now takes an optional pre-configured http_client instead, and
+        # doesn't manage that client's lifecycle when we provide one
+        # ourselves, so we own the `async with` here.
+        http_client = httpx2.AsyncClient(
+            timeout=httpx2.Timeout(
+                connect=timeout,
+                read=read_timeout,
+                write=read_timeout,
+                pool=read_timeout,
+            ),
+            follow_redirects=True,
+        )
+        async with http_client:
+            async with streamable_http_client(url, http_client=http_client) as (
+                read,
+                write,
+            ):
+                yield read, write
     elif transport == "stdio":
         params = StdioServerParameters(command=command, args=args or [], env=env)
         async with stdio_client(params) as (read, write):
@@ -162,7 +180,7 @@ async def _discover_backend(backend: dict) -> int:
                         types.Tool(
                             name=prefixed,
                             description=f"[{name}] {tool.description or ''}".strip(),
-                            inputSchema=tool.inputSchema,
+                            input_schema=tool.input_schema,
                         )
                     )
                     logger.info("  registered: %s", prefixed)
@@ -270,6 +288,37 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
         async with ClientSession(read, write) as session:
             await session.initialize()
             return await session.call_tool(entry.original_name, merged)
+
+
+# mcp 2.0's low-level Server registers request handlers as constructor
+# kwargs (on_list_tools / on_call_tool) instead of decorators applied after
+# construction — these have to exist before Server(...) is called, so they
+# live at module level rather than nested inside main() like their
+# decorator-based predecessors were.
+
+
+async def _handle_list_tools(ctx, params) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=_tool_list)
+
+
+async def _handle_call_tool(
+    ctx, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    name = params.name
+    arguments = params.arguments or {}
+    if name not in _tool_registry:
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"Unknown tool: {name}")],
+            isError=True,
+        )
+    try:
+        return await _proxy_call(name, arguments)
+    except Exception as e:
+        logger.error("Tool call failed — %s: %s", name, e)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"Backend error: {e}")],
+            isError=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +457,15 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
 
 def build_starlette_app(server: Server) -> Starlette:
     # --- Streamable HTTP transport (Claude Desktop, modern clients) ---
+    # stateless=False kept deliberately, not left over from the mcp 1.x port:
+    # StreamableHTTPSessionManager's constructor is unchanged in mcp 2.0 (same
+    # param, same default), and every piece of this aggregator's own state
+    # (_tool_registry, _session_pool, _backends, etc.) is a module-level
+    # global, not scoped to any particular client's MCP session — there is no
+    # app-level session affinity here for a stateless mode to threaten. If a
+    # future mcp SDK release removes this parameter entirely (the spec's
+    # long-term direction per SEP-2567), revisit then; nothing here forces an
+    # earlier change.
     session_manager = StreamableHTTPSessionManager(app=server, stateless=False)
     streamable_app = StreamableHTTPASGIApp(session_manager)
 
@@ -495,27 +553,11 @@ async def main() -> None:
         len(backends),
     )
 
-    server = Server("mcp-aggregator")
-
-    @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
-        return _tool_list
-
-    @server.call_tool(validate_input=False)
-    async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
-        if name not in _tool_registry:
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Unknown tool: {name}")],
-                isError=True,
-            )
-        try:
-            return await _proxy_call(name, arguments)
-        except Exception as e:
-            logger.error("Tool call failed — %s: %s", name, e)
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Backend error: {e}")],
-                isError=True,
-            )
+    server = Server(
+        "mcp-aggregator",
+        on_list_tools=_handle_list_tools,
+        on_call_tool=_handle_call_tool,
+    )
 
     if "--stdio" in sys.argv:
         from mcp.server.stdio import stdio_server

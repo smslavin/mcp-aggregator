@@ -8,11 +8,11 @@ import os
 import random
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 load_dotenv()
 
-mcp = FastMCP("mock-backend", port=int(os.environ.get("MOCK_PORT", 8003)))
+mcp = MCPServer("mock-backend")
 
 
 @mcp.tool()
@@ -64,4 +64,4 @@ async def set_setpoint(tag: str, value: float, operator: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run("sse")
+    mcp.run("sse", port=int(os.environ.get("MOCK_PORT", 8003)))

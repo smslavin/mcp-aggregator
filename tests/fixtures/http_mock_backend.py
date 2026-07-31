@@ -4,9 +4,9 @@ Spawned as a subprocess by tests, never run directly by a human."""
 
 import argparse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
-mcp = FastMCP("http-mock-backend")
+mcp = MCPServer("http-mock-backend")
 
 
 @mcp.tool()
@@ -34,5 +34,4 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
-    mcp.settings.port = args.port
-    mcp.run(args.transport)
+    mcp.run(args.transport, port=args.port)
