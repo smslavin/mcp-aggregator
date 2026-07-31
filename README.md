@@ -1,5 +1,7 @@
 # mcp-aggregator
 
+[![Tests](https://github.com/smslavin/mcp-aggregator/actions/workflows/test.yml/badge.svg)](https://github.com/smslavin/mcp-aggregator/actions/workflows/test.yml)
+
 Single endpoint that aggregates multiple backend MCP servers into one unified tool namespace.
 
 ```
