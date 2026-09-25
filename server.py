@@ -22,6 +22,9 @@ Management API (same token rule as the MCP endpoints, see "Network access" below
 Network access:
   AGGREGATOR_BIND_HOST   Default 127.0.0.1. A non-loopback address requires
                          AGGREGATOR_AUTH_TOKEN, or the server refuses to start.
+  AGGREGATOR_READ_ONLY   1/true/yes hides and refuses every backend tool not
+                         annotated readOnlyHint=true. Tool annotations are
+                         forwarded to clients either way.
   AGGREGATOR_AUTH_TOKEN  When set, every request must send
                          "Authorization: Bearer <token>". The aggregator exposes
                          backend write tools with no confirmation step, so it
@@ -74,6 +77,7 @@ class BackendEntry:
     command: str | None = None
     args: list[str] | None = None
     env: dict[str, str] | None = None
+    read_only: bool = False
 
 
 _tool_registry: dict[str, BackendEntry] = {}
@@ -185,12 +189,15 @@ async def _discover_backend(backend: dict) -> int:
                         command=command,
                         args=args,
                         env=env,
+                        read_only=_is_read_only(tool),
                     )
                     _tool_list.append(
                         types.Tool(
                             name=prefixed,
                             description=f"[{name}] {tool.description or ''}".strip(),
                             input_schema=tool.input_schema,
+                            # Forward safety hints so clients can gate writes.
+                            annotations=tool.annotations,
                         )
                     )
                     logger.info("  registered: %s", prefixed)
@@ -307,7 +314,28 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
 # decorator-based predecessors were.
 
 
+def _is_read_only(tool: types.Tool) -> bool:
+    """True only when the backend explicitly declares readOnlyHint.
+
+    Unannotated tools count as writes, matching the MCP spec defaults.
+    """
+    return bool(tool.annotations and tool.annotations.read_only_hint)
+
+
+def _read_only_mode() -> bool:
+    """AGGREGATOR_READ_ONLY=1 hides and refuses every tool not marked read-only."""
+    return os.environ.get("AGGREGATOR_READ_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 async def _handle_list_tools(ctx, params) -> types.ListToolsResult:
+    if _read_only_mode():
+        return types.ListToolsResult(
+            tools=[t for t in _tool_list if _tool_registry[t.name].read_only]
+        )
     return types.ListToolsResult(tools=_tool_list)
 
 
@@ -319,6 +347,17 @@ async def _handle_call_tool(
     if name not in _tool_registry:
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"Unknown tool: {name}")],
+            isError=True,
+        )
+    if _read_only_mode() and not _tool_registry[name].read_only:
+        return types.CallToolResult(
+            content=[
+                types.TextContent(
+                    type="text",
+                    text=f"Refused: {name} can change the system and this "
+                    "aggregator is running read-only (AGGREGATOR_READ_ONLY).",
+                )
+            ],
             isError=True,
         )
     try:
