@@ -20,13 +20,15 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+# -- Configuration --------------------------------------------------------------
 
 $Root          = $PSScriptRoot
 $Port          = "8100"
 $BackendsFile  = "backends.production.json"  # relative to $Root; use backends.json for demo
+# Backend services to start before the aggregator. Ones not installed are skipped.
+$BackendServices = @("AVEVA Demo GRAccessMCP", "AVEVA Demo MqttMCP", "AVEVA Demo OpcuaMCP")
 
-# ── End Configuration ──────────────────────────────────────────────────────────
+# -- End Configuration ----------------------------------------------------------
 
 if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
     Write-Error "nssm not found on PATH. Download from https://nssm.cc/download and add to PATH."
@@ -48,7 +50,7 @@ if ($existing) {
 
 nssm install $svcName $exe "server.py"
 nssm set $svcName AppDirectory $Root
-nssm set $svcName Description "MCP Aggregator — unified SSE endpoint for all backend MCP servers (port $Port)"
+nssm set $svcName Description "MCP Aggregator - unified SSE endpoint for all backend MCP servers (port $Port)"
 
 $envBlock = "AGGREGATOR_PORT=$Port`nBACKENDS_FILE=$BackendsFile"
 nssm set $svcName AppEnvironmentExtra $envBlock
@@ -64,8 +66,21 @@ nssm set $svcName AppExit Default Restart
 nssm set $svcName AppRestartDelay 60000
 nssm set $svcName Start SERVICE_AUTO_START
 
+# Tool discovery runs once at startup, so backends should be started first.
+# Written to the registry because nssm set can't take multiple service names
+# containing spaces. Re-run this script after installing a missing backend.
+$deps    = @($BackendServices | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+$missing = @($BackendServices | Where-Object { $deps -notcontains $_ })
+if ($deps.Count -gt 0) {
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName" -Name DependOnService -Type MultiString -Value $deps
+    Write-Host "Dependencies set: $($deps -join ', ')"
+}
+if ($missing.Count -gt 0) {
+    Write-Warning "Not installed, no dependency set: $($missing -join ', '). Re-run after installing them."
+}
+
 nssm start $svcName
 Start-Sleep -Milliseconds 500
 $status = (Get-Service -Name $svcName).Status
-Write-Host "$svcName — $status" -ForegroundColor Green
+Write-Host "$svcName - $status" -ForegroundColor Green
 Write-Host "Logs: $LogDir"
