@@ -626,7 +626,9 @@ async def main() -> None:
         userver = uvicorn.Server(config)
         logger.info(
             "Starting aggregator on %s:%d (auth %s)",
-            bind_host, port, "on" if auth_token else "off",
+            bind_host,
+            port,
+            "on" if auth_token else "off",
         )
         await userver.serve()
 
