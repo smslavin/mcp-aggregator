@@ -13,14 +13,24 @@ Serves two transports on the same port:
   GET/POST /mcp  — Streamable HTTP (Claude Desktop, modern MCP clients)
   GET      /sse  — Legacy SSE (older clients, custom chat UIs)
 
-Management API (unauthenticated — see README for OT environment guidance):
+Management API (same token rule as the MCP endpoints, see "Network access" below):
   GET    /backends         — list active backends and tool counts
   POST   /backends         — add a backend at runtime
   DELETE /backends/{name}  — remove a backend at runtime
   POST   /backends/reload  — re-read backends.json and reconcile
+
+Network access:
+  AGGREGATOR_BIND_HOST   Default 127.0.0.1. A non-loopback address requires
+                         AGGREGATOR_AUTH_TOKEN, or the server refuses to start.
+  AGGREGATOR_AUTH_TOKEN  When set, every request must send
+                         "Authorization: Bearer <token>". The aggregator exposes
+                         backend write tools with no confirmation step, so it
+                         must never be reachable without one.
 """
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -455,6 +465,47 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def load_network_settings() -> tuple[str, str | None]:
+    """Return (bind_host, token). Exit if an external bind has no token."""
+    host = os.environ.get("AGGREGATOR_BIND_HOST", "127.0.0.1").strip()
+    token = os.environ.get("AGGREGATOR_AUTH_TOKEN", "").strip() or None
+    if not _is_loopback(host) and token is None:
+        raise SystemExit(
+            f"Refusing to listen on {host} without AGGREGATOR_AUTH_TOKEN. Set a "
+            "token, or unset AGGREGATOR_BIND_HOST to stay on 127.0.0.1."
+        )
+    return host, token
+
+
+def require_bearer_token(app, token: str | None):
+    """ASGI wrapper that rejects HTTP requests without the bearer token."""
+    if token is None:
+        return app
+    expected = f"Bearer {token}".encode()
+
+    async def guarded(scope, receive, send):
+        if scope.get("type") == "http":
+            supplied = next(
+                (v for k, v in scope.get("headers", []) if k == b"authorization"), b""
+            )
+            if not hmac.compare_digest(supplied, expected):
+                response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
+        await app(scope, receive, send)
+
+    return guarded
+
+
 def build_starlette_app(server: Server) -> Starlette:
     # --- Streamable HTTP transport (Claude Desktop, modern clients) ---
     # stateless=False kept deliberately, not left over from the mcp 1.x port:
@@ -536,6 +587,9 @@ def build_starlette_app(server: Server) -> Starlette:
 async def main() -> None:
     global _backends_path
 
+    # Validate before discovery so a bad config fails fast.
+    bind_host, auth_token = load_network_settings()
+
     backends_file = os.environ.get("BACKENDS_FILE", "backends.json")
     _backends_path = (
         backends_file
@@ -566,11 +620,14 @@ async def main() -> None:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
     else:
-        app = build_starlette_app(server)
+        app = require_bearer_token(build_starlette_app(server), auth_token)
         port = int(os.environ.get("AGGREGATOR_PORT", 8100))
-        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+        config = uvicorn.Config(app, host=bind_host, port=port, log_level="info")
         userver = uvicorn.Server(config)
-        logger.info("Starting aggregator on port %d", port)
+        logger.info(
+            "Starting aggregator on %s:%d (auth %s)",
+            bind_host, port, "on" if auth_token else "off",
+        )
         await userver.serve()
 
 

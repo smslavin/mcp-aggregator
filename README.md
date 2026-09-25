@@ -218,15 +218,32 @@ rather than spawning a fresh process per call, since many adapters expose an exp
 ready yet (or drops), a call falls back to briefly spawning its own subprocess for that
 one call, then the pool reconnects on its own.
 
+## Network access
+
+The aggregator exposes every backend tool, including galaxy write tools, with no
+confirmation step. It therefore listens on `127.0.0.1` by default. To reach it
+from another machine, set both variables (in `.env` or the service environment):
+
+```
+AGGREGATOR_BIND_HOST=0.0.0.0
+AGGREGATOR_AUTH_TOKEN=<long random string>
+```
+
+The aggregator refuses to start on a non-loopback address without a token. When a
+token is set, every request (MCP transports and the management API) must send
+`Authorization: Bearer <token>`, including requests from localhost. Clients on the
+same machine, such as the chat UI, need the token too (`AGGREGATOR_AUTH_TOKEN` in
+graccess-mcp's `chat_ui\.env`).
+
+Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+Open port 8100 in the firewall only when remote clients need it.
+
 ## Management API
 
 The aggregator exposes a runtime management API for adding and removing backends
-without restarting. All endpoints are unauthenticated.
-
-> **OT environment note:** In a live operational technology environment, expose the
-> management API only on a trusted network interface or behind a reverse proxy with
-> access controls. Unauthenticated `POST /backends` allows any caller to register
-> an arbitrary backend server.
+without restarting. It follows the same token rule as the MCP endpoints.
+`POST /backends` lets a caller register an arbitrary backend, so keep the token
+secret and the port closed where it isn't needed.
 
 | Method | Path | Description |
 |---|---|---|
@@ -243,6 +260,7 @@ connections but won't be visible to already-connected clients until they reconne
 
 ```bash
 curl -X POST http://localhost:8100/backends \
+  -H "Authorization: Bearer $AGGREGATOR_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "historian", "url": "http://192.168.1.50:8005/sse"}'
 ```
@@ -250,8 +268,11 @@ curl -X POST http://localhost:8100/backends \
 ### Example: reload from backends.json
 
 ```bash
-curl -X POST http://localhost:8100/backends/reload
+curl -X POST http://localhost:8100/backends/reload \
+  -H "Authorization: Bearer $AGGREGATOR_AUTH_TOKEN"
 ```
+
+Omit the `Authorization` header if no token is set.
 
 ## Running as a Windows service
 
@@ -287,11 +308,19 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
   "mcpServers": {
     "scada": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://<aggregator-host>:8100/mcp", "--allow-http"]
+      "args": [
+        "-y", "mcp-remote", "http://<aggregator-host>:8100/mcp", "--allow-http",
+        "--header", "Authorization:${AUTH_HEADER}"
+      ],
+      "env": { "AUTH_HEADER": "Bearer <token>" }
     }
   }
 }
 ```
+
+The header value goes through `env` because Claude Desktop on Windows mangles
+spaces inside `args`. Drop the `--header` pair and `env` when the aggregator has
+no token (localhost only).
 
 Replace `<aggregator-host>` with the IP or hostname of the machine running the aggregator
 (e.g. `192.168.80.134`). Use `localhost` if Claude Desktop and the aggregator are on the
