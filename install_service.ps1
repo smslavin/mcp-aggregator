@@ -34,6 +34,18 @@ if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
     Write-Error "nssm not found on PATH. Download from https://nssm.cc/download and add to PATH."
 }
 
+# backends.production.json is gitignored (site-specific). Seed it from the
+# committed example on first install; never overwrite an existing one.
+$backendsPath = Join-Path $Root $BackendsFile
+if (-not (Test-Path $backendsPath)) {
+    $example = [System.IO.Path]::ChangeExtension($backendsPath, ".example.json")
+    if (-not (Test-Path $example)) {
+        Write-Error "$BackendsFile not found and no example to copy ($example)."
+    }
+    Copy-Item $example $backendsPath
+    Write-Host "Created $BackendsFile from $(Split-Path $example -Leaf)"
+}
+
 $LogDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 

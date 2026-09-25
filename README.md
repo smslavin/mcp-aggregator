@@ -121,6 +121,11 @@ Edit to add or remove backends. The aggregator reads this at startup. Set the
 script directory, or absolute path) — useful for keeping separate demo and production
 configs without modifying `backends.json`.
 
+The Windows service uses `backends.production.json`. It is gitignored so each site
+can edit it freely. `install_service.ps1` (and `graccess-mcp\install_services.ps1`)
+create it from `backends.production.example.json` if it doesn't exist, and never
+overwrite an existing file.
+
 ```json
 [
   { "name": "opcua", "url": "http://localhost:8002/sse" },
