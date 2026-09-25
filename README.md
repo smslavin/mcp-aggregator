@@ -238,6 +238,19 @@ graccess-mcp's `chat_ui\.env`).
 Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 Open port 8100 in the firewall only when remote clients need it.
 
+## Tool safety annotations and read-only mode
+
+The aggregator forwards each backend tool's MCP annotations (`readOnlyHint`,
+`destructiveHint`, ...) unchanged, so clients such as the graccess-mcp chat UI or
+Claude Desktop can decide which calls need a human to confirm them.
+
+Set `AGGREGATOR_READ_ONLY=1` to expose only tools that declare
+`readOnlyHint=true`. Every other tool is hidden from `tools/list` and refused if
+called, including tools with no annotations, because MCP treats a missing
+annotation as "may write". Use it on shared or public machines where nobody
+should be able to change the galaxy through the aggregator. Clients that go
+through the aggregator (the chat UI included) become read-only as well.
+
 ## Management API
 
 The aggregator exposes a runtime management API for adding and removing backends
