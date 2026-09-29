@@ -198,6 +198,9 @@ async def _discover_backend(backend: dict) -> int:
                             input_schema=tool.input_schema,
                             # Forward safety hints so clients can gate writes.
                             annotations=tool.annotations,
+                            # And the shape of structuredContent, which call
+                            # results already carry through unchanged.
+                            output_schema=tool.output_schema,
                         )
                     )
                     logger.info("  registered: %s", prefixed)
