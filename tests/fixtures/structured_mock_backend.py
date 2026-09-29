@@ -3,10 +3,12 @@ and structured data for a UI in the same result, for the structured-output
 tests. Spawned as a subprocess by tests, never run directly by a human.
 """
 
-from typing import Annotated, TypedDict
+from typing import Annotated
 
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+# pydantic needs typing_extensions.TypedDict to build a schema on Python < 3.12.
+from typing_extensions import TypedDict
 
 mcp = MCPServer("structured-mock-backend")
 
