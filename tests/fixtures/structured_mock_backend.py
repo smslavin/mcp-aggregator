@@ -7,6 +7,7 @@ from typing import Annotated
 
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+
 # pydantic needs typing_extensions.TypedDict to build a schema on Python < 3.12.
 from typing_extensions import TypedDict
 
