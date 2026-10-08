@@ -173,6 +173,9 @@ async def _discover_backend(backend: dict) -> int:
             result = await session.list_tools()
             registered = 0
             async with _registry_lock:
+                # Replace, never duplicate: reload and the startup retry can
+                # both discover the same backend.
+                _purge_tools(name)
                 _backends[name] = backend
                 for tool in result.tools:
                     if include and tool.name not in include:
@@ -208,7 +211,9 @@ async def _discover_backend(backend: dict) -> int:
             return registered
 
 
-async def discover_all(backends: list[dict]) -> None:
+async def discover_all(backends: list[dict]) -> list[dict]:
+    """Discover every backend once. Returns the ones that couldn't be reached."""
+    failed = []
     for backend in backends:
         name = backend["name"]
         desc = _backend_desc(backend)
@@ -220,6 +225,75 @@ async def discover_all(backends: list[dict]) -> None:
             raise
         except Exception as e:
             logger.error("Failed to reach backend '%s' (%s): %s", name, desc, e)
+            failed.append(backend)
+    return failed
+
+
+# Backends from the backends file that failed discovery and are still being
+# retried, by name, and the names the file lists now (main() and reload set
+# both). Reload drops a pending name that leaves the file.
+_pending_discovery: dict[str, dict] = {}
+_file_backend_names: set[str] = set()
+_retry_task: asyncio.Task | None = None
+_RETRY_MIN_S = 2.0
+_RETRY_MAX_S = 60.0
+
+
+def _queue_retry(backends: list[dict]) -> None:
+    """Retry these backends in the background until each one answers."""
+    global _retry_task
+    for backend in backends:
+        _pending_discovery[backend["name"]] = backend
+    if _pending_discovery and (_retry_task is None or _retry_task.done()):
+        _retry_task = asyncio.create_task(_retry_pending_backends())
+
+
+async def _retry_pending_backends() -> None:
+    """Retry backends that failed discovery until each one answers.
+
+    As Windows services, a backend can still be starting when the aggregator
+    discovers tools (a service counts as started before it listens), and
+    discovery used to run only once, leaving that backend's tools missing
+    until a restart. Backs off from 2 s to 60 s; exits once nothing is
+    pending or on shutdown.
+    """
+    delay = _RETRY_MIN_S
+    while _pending_discovery:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(_shutdown_event.wait()), timeout=delay
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        for name, backend in list(_pending_discovery.items()):
+            if name in _backends:  # added meanwhile by reload or POST /backends
+                _pending_discovery.pop(name, None)
+                continue
+            try:
+                count = await _discover_backend(backend)
+            except Exception as e:
+                logger.warning(
+                    "Backend '%s' still unreachable, retrying in up to %.0fs: %s",
+                    name,
+                    min(delay * 2, _RETRY_MAX_S),
+                    e,
+                )
+                continue
+            _pending_discovery.pop(name, None)
+            # Reload may have dropped it from the file while discovery ran.
+            if name not in _file_backend_names:
+                await _remove_backend(name)
+                continue
+            logger.info("Backend '%s' reachable on retry: %d tool(s)", name, count)
+            if (
+                backend.get("transport") in _POOLED_TRANSPORTS
+                and name not in _pool_tasks
+            ):
+                _pool_tasks[name] = asyncio.create_task(
+                    _run_persistent_pool(name, backend)
+                )
+        delay = min(delay * 2, _RETRY_MAX_S)
 
 
 # ---------------------------------------------------------------------------
@@ -378,12 +452,18 @@ async def _handle_call_tool(
 # ---------------------------------------------------------------------------
 
 
+def _purge_tools(name: str) -> int:
+    """Drop a backend's tools from the registry. Caller holds _registry_lock."""
+    keys = [k for k in _tool_registry if k.startswith(f"{name}__")]
+    for k in keys:
+        del _tool_registry[k]
+    _tool_list[:] = [t for t in _tool_list if not t.name.startswith(f"{name}__")]
+    return len(keys)
+
+
 async def _remove_backend(name: str) -> int:
     async with _registry_lock:
-        keys = [k for k in _tool_registry if k.startswith(f"{name}__")]
-        for k in keys:
-            del _tool_registry[k]
-        _tool_list[:] = [t for t in _tool_list if not t.name.startswith(f"{name}__")]
+        removed = _purge_tools(name)
         _backends.pop(name, None)
 
     task = _pool_tasks.pop(name, None)
@@ -395,7 +475,7 @@ async def _remove_backend(name: str) -> int:
             pass
     _session_pool.pop(name, None)
 
-    return len(keys)
+    return removed
 
 
 async def handle_backends(request: Request) -> JSONResponse:
@@ -471,6 +551,10 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
 
     new_names = {b["name"] for b in new_backends}
     old_names = set(_backends.keys())
+    _file_backend_names.clear()
+    _file_backend_names.update(new_names)
+    for name in set(_pending_discovery) - new_names:
+        del _pending_discovery[name]
 
     removed_total = 0
     for name in old_names - new_names:
@@ -479,12 +563,17 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
 
     added_total = 0
     errors = []
+    unreachable = []
     for backend in new_backends:
         if backend["name"] not in old_names:
             try:
                 count = await _discover_backend(backend)
+                _pending_discovery.pop(backend["name"], None)
                 added_total += count
-                if backend.get("transport") in _POOLED_TRANSPORTS:
+                if (
+                    backend.get("transport") in _POOLED_TRANSPORTS
+                    and backend["name"] not in _pool_tasks
+                ):
                     task = asyncio.create_task(
                         _run_persistent_pool(backend["name"], backend)
                     )
@@ -494,8 +583,12 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
                     backend["name"],
                     count,
                 )
+            except ValueError as e:  # bad config; retrying won't help
+                errors.append({"backend": backend["name"], "error": str(e)})
             except Exception as e:
                 errors.append({"backend": backend["name"], "error": str(e)})
+                unreachable.append(backend)
+    _queue_retry(unreachable)
 
     return JSONResponse(
         {"added_tools": added_total, "removed_tools": removed_total, "errors": errors}
@@ -641,8 +734,10 @@ async def main() -> None:
     with open(_backends_path) as f:
         backends = json.load(f)
 
-    await discover_all(backends)
-    await _start_pool_tasks(backends)
+    _file_backend_names.update(b["name"] for b in backends)
+    failed = await discover_all(backends)
+    await _start_pool_tasks([b for b in backends if b not in failed])
+    _queue_retry(failed)
     logger.info(
         "Ready — %d tool(s) aggregated from %d backend(s)",
         len(_tool_list),
