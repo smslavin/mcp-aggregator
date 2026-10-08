@@ -47,6 +47,12 @@ Every tool call identifies both the domain and the operation.
 the routing is explicit and collision-free. Streamable HTTP backends also start a
 persistent pooled session at this point.
 
+A backend that can't be reached at startup, such as a Windows service still
+starting, is retried in the background every 2 s, backing off to 60 s, until it
+answers; its tools then appear without a restart. `POST /backends/reload` hands
+backends it can't reach to the same retry. Clients that cached the tool list
+need to list tools again to see them.
+
 **Runtime:** each tool call is routed to the originating backend. Streamable HTTP
 backends use the persistent pooled session; SSE backends open a fresh connection per
 call. The aggregator adds no parsing or transformation — it is a transparent proxy.

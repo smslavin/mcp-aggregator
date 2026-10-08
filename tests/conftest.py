@@ -41,6 +41,14 @@ async def _reset_aggregator_state():
             f"test left pool task(s) running: {leaked} — cancel and await "
             "them in the test itself before returning"
         )
+    retry, agg._retry_task = agg._retry_task, None
+    agg._pending_discovery.clear()
+    agg._file_backend_names.clear()
+    if retry is not None and not retry.done():
+        raise RuntimeError(
+            "test left the discovery retry task running — cancel and await "
+            "it in the test itself before returning"
+        )
     agg._tool_registry.clear()
     agg._tool_list.clear()
     agg._backends.clear()
