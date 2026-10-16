@@ -148,6 +148,47 @@ async def _make_client(
 # ---------------------------------------------------------------------------
 
 
+TRANSPORTS = ("sse", "streamable_http", "stdio")
+
+
+def check_backend(backend) -> None:
+    """Raise ValueError for an entry the aggregator can't use as written.
+
+    An unknown transport used to fall through to SSE, and a name with "__"
+    or a trailing "_" makes prefixed tool names collide with another
+    backend's (mcp-aggregator#11).
+    """
+    if not isinstance(backend, dict):
+        raise ValueError(f"backend entry must be an object, not {backend!r}")
+    name = backend.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"backend entry has no name: {backend!r}")
+    if "__" in name or name.endswith("_"):
+        raise ValueError(
+            f"backend '{name}': a name may not contain '__' or end with '_'"
+        )
+    transport = backend.get("transport", "sse")
+    if transport not in TRANSPORTS:
+        raise ValueError(
+            f"backend '{name}': unknown transport {transport!r} (use {', '.join(TRANSPORTS)})"
+        )
+    needed = "command" if transport == "stdio" else "url"
+    if not backend.get(needed):
+        raise ValueError(f"backend '{name}': transport {transport} needs a {needed}")
+
+
+def check_backends(backends) -> None:
+    """Raise ValueError unless every entry is usable and the names are unique."""
+    if not isinstance(backends, list):
+        raise ValueError("the backends file must hold a JSON list")
+    seen = set()
+    for backend in backends:
+        check_backend(backend)
+        if backend["name"] in seen:
+            raise ValueError(f"backend '{backend['name']}' is listed twice")
+        seen.add(backend["name"])
+
+
 def _backend_desc(backend: dict) -> str:
     if backend.get("transport") == "stdio":
         return " ".join([backend.get("command", "")] + (backend.get("args") or []))
@@ -155,6 +196,7 @@ def _backend_desc(backend: dict) -> str:
 
 
 async def _discover_backend(backend: dict) -> int:
+    check_backend(backend)
     name = backend["name"]
     transport = backend.get("transport", "sse")
     url = backend.get("url")
@@ -568,6 +610,13 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": f"Could not read backends file: {e}"}, status_code=500
         )
+    try:
+        check_backends(new_backends)
+    except ValueError as e:
+        # Nothing changes: a half-applied bad file would drop good backends.
+        return JSONResponse(
+            {"error": f"Backends file not loaded: {e}"}, status_code=400
+        )
 
     new_names = {b["name"] for b in new_backends}
     old_names = set(_backends.keys())
@@ -805,6 +854,10 @@ async def main() -> None:
     )
     with open(_backends_path) as f:
         backends = json.load(f)
+    try:
+        check_backends(backends)
+    except ValueError as e:
+        raise SystemExit(f"{_backends_path}: {e}") from None
 
     _file_backend_names.update(b["name"] for b in backends)
     failed = await discover_all(backends)

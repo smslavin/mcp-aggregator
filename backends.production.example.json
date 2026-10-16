@@ -1,5 +1,6 @@
 [
+  { "name": "mes",      "url": "http://127.0.0.1:8007/sse" },
   { "name": "graccess", "url": "http://127.0.0.1:8000/sse" },
-  { "name": "mqtt",     "url": "http://127.0.0.1:8001/sse" },
+  { "name": "mqtt",     "url": "http://127.0.0.1:8003/sse" },
   { "name": "opcua",    "url": "http://127.0.0.1:8002/sse" }
 ]

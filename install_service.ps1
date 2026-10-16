@@ -7,10 +7,10 @@
     Installs one service: AVEVA Demo McpAggregator (port 8100).
     NSSM must be on PATH (https://nssm.cc/download). Run as Administrator.
 
-    The aggregator discovers tools from its backend MCP servers at startup.
-    Start graccess-mcp (8000), mqtt-mcp (8001), and opcua-mcp (8002) before
-    starting this service, or tool discovery for unavailable backends will be
-    skipped (logged as errors, not fatal).
+    The aggregator discovers tools from its backend MCP servers at startup,
+    and keeps retrying a backend that isn't up yet, so it depends on no other
+    service. A dependency would make stopping any one backend's service stop
+    the aggregator, and with it every product's tools.
 
 .EXAMPLE
     # Edit the Configuration block below, then:
@@ -25,8 +25,6 @@ $ErrorActionPreference = "Stop"
 $Root          = $PSScriptRoot
 $Port          = "8100"
 $BackendsFile  = "backends.production.json"  # relative to $Root; use backends.json for demo
-# Backend services to start before the aggregator. Ones not installed are skipped.
-$BackendServices = @("AVEVA Demo GRAccessMCP", "AVEVA Demo MqttMCP", "AVEVA Demo OpcuaMCP")
 
 # -- End Configuration ----------------------------------------------------------
 
@@ -78,18 +76,10 @@ nssm set $svcName AppExit Default Restart
 nssm set $svcName AppRestartDelay 60000
 nssm set $svcName Start SERVICE_AUTO_START
 
-# Tool discovery runs once at startup, so backends should be started first.
-# Written to the registry because nssm set can't take multiple service names
-# containing spaces. Re-run this script after installing a missing backend.
-$deps    = @($BackendServices | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
-$missing = @($BackendServices | Where-Object { $deps -notcontains $_ })
-if ($deps.Count -gt 0) {
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName" -Name DependOnService -Type MultiString -Value $deps
-    Write-Host "Dependencies set: $($deps -join ', ')"
-}
-if ($missing.Count -gt 0) {
-    Write-Warning "Not installed, no dependency set: $($missing -join ', '). Re-run after installing them."
-}
+# No service dependencies: the aggregator retries a backend that isn't up yet,
+# and a dependency would stop it whenever one backend's service stops
+# (mcp-aggregator#11). Older installs set some; clear them.
+Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName" -Name DependOnService -ErrorAction SilentlyContinue
 
 nssm start $svcName
 Start-Sleep -Milliseconds 500
