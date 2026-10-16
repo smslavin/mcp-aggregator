@@ -122,15 +122,23 @@ The aggregator runs on port 8100 by default. Set `AGGREGATOR_PORT` in `.env` to 
 
 ## backends.json
 
-Edit to add or remove backends. The aggregator reads this at startup. Set the
-`BACKENDS_FILE` environment variable to point at a different file (relative to the
-script directory, or absolute path) — useful for keeping separate demo and production
-configs without modifying `backends.json`.
+`backends.json` is the demo's list: the mock backend `start_demo` runs on 8003, under
+the name `influxdb`. Set the `BACKENDS_FILE` environment variable to point at a
+different file (relative to the script directory, or absolute path).
 
 The Windows service uses `backends.production.json`. It is gitignored so each site
-can edit it freely. `install_service.ps1` (and `graccess-mcp\install_services.ps1`)
-create it from `backends.production.example.json` if it doesn't exist, and never
-overwrite an existing file.
+can edit it freely. `install_service.ps1` (and graccess-mcp's and mes-mcp's
+installers) create it from `backends.production.example.json` if it doesn't exist,
+and never overwrite an existing file. The example matches the demo VM: mes on 8007,
+graccess on 8000, MQTT on 8003 (8001 is IIS there) and OPC-UA on 8002.
+
+The aggregator checks the file at startup and refuses to start if an entry has no
+name, a name containing `__` or ending in `_`, an unknown `transport`, no `url` (or
+`command` for stdio), or a name listed twice. `POST /backends/reload` with such a file
+returns 400 and changes nothing.
+
+`start_demo.ps1` frees ports 8003 and 8100 by killing what listens there, so it
+refuses to run where the AVEVA Demo services are installed; pass `-Force` to override.
 
 ```json
 [

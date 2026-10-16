@@ -1,6 +1,20 @@
 # Start all demo processes: mock backend + aggregator.
 # Each runs in its own PowerShell window that stays open so errors are visible.
 # Run opcua-mcp separately if you want OPC-UA tools too.
+#
+# It frees ports 8003 and 8100 by killing whatever listens there. On a machine
+# with the AVEVA Demo services (MDDEMO), those are the MQTT MCP server and the
+# shared aggregator, so it refuses to run there unless you pass -Force.
+param([switch]$Force)
+
+$installed = @(Get-Service -Name 'AVEVA Demo McpAggregator', 'AVEVA Demo MqttMCP' -ErrorAction SilentlyContinue)
+if ($installed.Count -gt 0 -and -not $Force) {
+    Write-Host "The AVEVA Demo services are installed here:" -ForegroundColor Red
+    $installed | ForEach-Object { Write-Host "  $($_.Name) ($($_.Status))" -ForegroundColor Red }
+    Write-Host "start_demo.ps1 would kill them to free ports 8003 and 8100. It is for a dev machine" -ForegroundColor Red
+    Write-Host "without them. Pass -Force to run anyway." -ForegroundColor Red
+    exit 1
+}
 
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venv = "$dir\.venv\Scripts\python.exe"
