@@ -29,6 +29,12 @@ Network access:
                          "Authorization: Bearer <token>". The aggregator exposes
                          backend write tools with no confirmation step, so it
                          must never be reachable without one.
+  AGGREGATOR_ALLOWED_ORIGINS
+                         Comma-separated browser origins allowed to call the
+                         aggregator (e.g. http://localhost:6274 for the MCP
+                         Inspector). Default none: requests a web page makes
+                         are refused, and on a loopback bind so is any Host
+                         other than 127.0.0.1/localhost/[::1].
 """
 
 import asyncio
@@ -498,10 +504,24 @@ async def handle_backends(request: Request) -> JSONResponse:
         return JSONResponse({"backends": result, "total_tools": len(_tool_registry)})
 
     # POST — add a new backend
+    content_type = request.headers.get("content-type", "").split(";")[0].strip()
+    if content_type != "application/json":
+        return JSONResponse(
+            {"error": "Content-Type must be application/json"}, status_code=415
+        )
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    # A stdio backend is a command the aggregator runs with its own account
+    # (LocalSystem as a service), so only the backends file may define one.
+    if body.get("transport") == "stdio":
+        return JSONResponse(
+            {"error": "stdio backends can only be added through the backends file"},
+            status_code=403,
+        )
 
     name = body.get("name")
     if not name:
@@ -641,6 +661,58 @@ def require_bearer_token(app, token: str | None):
     return guarded
 
 
+def load_allowed_origins() -> set[str]:
+    """Browser origins allowed to call the aggregator (none by default)."""
+    raw = os.environ.get("AGGREGATOR_ALLOWED_ORIGINS", "")
+    return {o.strip().rstrip("/").lower() for o in raw.split(",") if o.strip()}
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+
+def refuse_browser_requests(app, bind_host: str, allowed_origins: set[str]):
+    """ASGI wrapper that refuses requests a web page made on someone's behalf.
+
+    MCP clients and curl send no Origin and no Sec-Fetch-Site, so they pass.
+    A browser sends Origin on every cross-origin POST, even a "no-cors" one
+    that skips the CORS preflight, and Sec-Fetch-Site on every request. With
+    no token on loopback, this is what stops a page in a local browser from
+    calling tools or the management API. On a loopback bind, the Host check
+    also stops DNS rebinding, where a page's own hostname resolves to
+    127.0.0.1 so its requests count as same-origin.
+    """
+    check_host = _is_loopback(bind_host)
+
+    def refusal(scope) -> str | None:
+        headers = dict(scope.get("headers", []))
+        origin = headers.get(b"origin", b"").decode("latin-1").rstrip("/").lower()
+        if origin:
+            return None if origin in allowed_origins else f"origin {origin} not allowed"
+        fetch_site = headers.get(b"sec-fetch-site", b"").decode("latin-1")
+        if fetch_site in ("cross-site", "same-site"):
+            return f"{fetch_site} browser request"
+        host = headers.get(b"host", b"").decode("latin-1").lower()
+        if check_host and host:
+            name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+            if name not in _LOOPBACK_HOSTS:
+                return f"host {host} not allowed"
+        return None
+
+    async def guarded(scope, receive, send):
+        if scope.get("type") == "http":
+            reason = refusal(scope)
+            if reason:
+                logger.warning(
+                    "Refused %s %s: %s", scope.get("method"), scope.get("path"), reason
+                )
+                response = JSONResponse({"error": "forbidden"}, status_code=403)
+                await response(scope, receive, send)
+                return
+        await app(scope, receive, send)
+
+    return guarded
+
+
 def build_starlette_app(server: Server) -> Starlette:
     # --- Streamable HTTP transport (Claude Desktop, modern clients) ---
     # stateless=False kept deliberately, not left over from the mcp 1.x port:
@@ -757,7 +829,11 @@ async def main() -> None:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
     else:
-        app = require_bearer_token(build_starlette_app(server), auth_token)
+        app = refuse_browser_requests(
+            require_bearer_token(build_starlette_app(server), auth_token),
+            bind_host,
+            load_allowed_origins(),
+        )
         port = int(os.environ.get("AGGREGATOR_PORT", 8100))
         config = uvicorn.Config(app, host=bind_host, port=port, log_level="info")
         userver = uvicorn.Server(config)

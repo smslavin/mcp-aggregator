@@ -262,7 +262,31 @@ through the aggregator (the chat UI included) become read-only as well.
 The aggregator exposes a runtime management API for adding and removing backends
 without restarting. It follows the same token rule as the MCP endpoints.
 `POST /backends` lets a caller register an arbitrary backend, so keep the token
-secret and the port closed where it isn't needed.
+secret and the port closed where it isn't needed. It only takes `sse` and
+`streamable_http` backends, with `Content-Type: application/json`. A `stdio` backend
+is a command the aggregator runs under its own account, so it can only come from the
+backends file.
+
+### Requests from web pages
+
+With no token on a loopback bind, any program on the machine can call the
+aggregator, including a web page open in a local browser. So the aggregator refuses
+every request a browser makes on a page's behalf, on the MCP endpoints and the
+management API alike:
+
+- a request with an `Origin` header, unless that origin is listed in
+  `AGGREGATOR_ALLOWED_ORIGINS`;
+- a request marked `Sec-Fetch-Site: cross-site` or `same-site`;
+- on a loopback bind, a `Host` other than `127.0.0.1`, `localhost` or `[::1]`, which
+  stops DNS rebinding.
+
+MCP clients, the site app and curl send none of these headers and are unaffected.
+Opening `http://127.0.0.1:8100/backends` in the address bar still works. To use a
+browser-based client such as the MCP Inspector, list its origin:
+
+```
+AGGREGATOR_ALLOWED_ORIGINS=http://localhost:6274
+```
 
 | Method | Path | Description |
 |---|---|---|

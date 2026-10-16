@@ -68,3 +68,98 @@ async def test_token_enforced(headers, status):
     client = TestClient(server.require_bearer_token(_app(), "s3cret"))
     assert client.get("/backends", headers=headers).status_code == status
     assert client.post("/backends", headers=headers).status_code == status
+
+
+# --- Requests a web page makes (#10) ---------------------------------------
+
+
+def _guarded(bind_host="127.0.0.1", origins=()):
+    return TestClient(
+        server.refuse_browser_requests(_app(), bind_host, set(origins)),
+        base_url="http://127.0.0.1:8100",
+    )
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},  # curl, MCP clients
+        {"Host": "localhost:8100"},
+        {"Host": "[::1]:8100"},
+        {"Sec-Fetch-Site": "none"},  # typed into the address bar
+        {"Sec-Fetch-Site": "same-origin"},
+    ],
+)
+async def test_non_browser_and_direct_requests_pass(headers):
+    assert _guarded().get("/backends", headers=headers).status_code == 200
+    assert _guarded().post("/backends", headers=headers).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        # A page's fetch(..., {mode: "no-cors", body: "..."}) — no preflight.
+        {"Origin": "https://evil.example", "Content-Type": "text/plain"},
+        {"Origin": "http://127.0.0.1:8080"},  # another local web app
+        {"Origin": "null"},  # sandboxed iframe, file:// page
+        {"Sec-Fetch-Site": "cross-site"},  # no-cors GET carries no Origin
+        {"Sec-Fetch-Site": "same-site"},
+        {"Host": "rebound.evil.example:8100"},  # DNS rebinding
+    ],
+)
+async def test_browser_requests_refused(headers):
+    assert _guarded().get("/backends", headers=headers).status_code == 403
+    assert _guarded().post("/backends", headers=headers).status_code == 403
+
+
+async def test_allowed_origin_passes():
+    client = _guarded(origins={"http://localhost:6274"})
+    headers = {"Origin": "http://localhost:6274/", "Sec-Fetch-Site": "same-site"}
+    assert client.post("/backends", headers=headers).status_code == 200
+
+
+async def test_host_not_checked_on_external_bind():
+    client = _guarded(bind_host="0.0.0.0")
+    assert client.get("/backends", headers={"Host": "mddemo:8100"}).status_code == 200
+
+
+async def test_allowed_origins_from_env(monkeypatch):
+    monkeypatch.setenv(
+        "AGGREGATOR_ALLOWED_ORIGINS", " http://localhost:6274/ ,HTTP://X:1"
+    )
+    assert server.load_allowed_origins() == {"http://localhost:6274", "http://x:1"}
+    monkeypatch.delenv("AGGREGATOR_ALLOWED_ORIGINS")
+    assert server.load_allowed_origins() == set()
+
+
+# --- POST /backends input rules (#10) --------------------------------------
+
+
+def _management():
+    return TestClient(
+        Starlette(routes=[Route("/backends", server.handle_backends, methods=["POST"])])
+    )
+
+
+async def test_add_backend_refuses_stdio(monkeypatch):
+    called = []
+    monkeypatch.setattr(server, "_discover_backend", lambda b: called.append(b))
+    body = {"name": "x", "transport": "stdio", "command": "powershell", "args": []}
+    response = _management().post("/backends", json=body)
+    assert response.status_code == 403
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "content, content_type, status",
+    [
+        ('{"name": "x", "url": "http://h/sse"}', "text/plain", 415),
+        ('{"name": "x", "url": "http://h/sse"}', None, 415),
+        ('["x"]', "application/json", 400),
+        ("not json", "application/json", 400),
+    ],
+)
+async def test_add_backend_requires_a_json_object(content, content_type, status):
+    headers = {"Content-Type": content_type} if content_type else {}
+    response = _management().post("/backends", content=content, headers=headers)
+    assert response.status_code == status
