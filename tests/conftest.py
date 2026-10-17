@@ -2,6 +2,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import anyio
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -14,6 +15,16 @@ def anyio_backend():
     return "asyncio"
 
 
+async def connect(config: dict, source: str = "file") -> "agg.BackendState":
+    """Add and activate a backend as the backends file would, pool included."""
+    state = agg._add(config, source)
+    assert await agg._activate(state), state.last_error
+    if state.pooled:
+        with anyio.fail_after(10):
+            await state.session_ready.wait()
+    return state
+
+
 @pytest.fixture(autouse=True)
 async def _reset_aggregator_state():
     """server.py holds all state in module-level globals. Reset them around
@@ -22,34 +33,19 @@ async def _reset_aggregator_state():
     _shutdown_event is recreated (not just .clear()ed) every test: an
     asyncio.Event binds to whichever event loop first calls .wait() on it
     and stays bound forever. Production only ever runs one loop for the
-    process's lifetime, so this never bites there — but pytest-anyio gives
-    each test its own fresh loop, so a stale Event from a previous test
-    raises "bound to a different event loop" the moment a later test's pool
-    awaits it. Recreating it here, inside this async fixture, binds it
-    fresh to the current test's loop.
-
-    Tests that start a persistent-pool task must cancel and await it
-    themselves, in their own event loop, before returning — for the same
-    per-test-loop reason, cancelling a task from here would be reaching
-    across loops too."""
+    process's lifetime, but each test gets its own loop. Teardown removes
+    every backend, which cancels its pool task, and cancels the retry and
+    notification tasks, in the loop the test ran in."""
     agg._shutdown_event = asyncio.Event()
     yield
-    if agg._pool_tasks:
-        leaked = list(agg._pool_tasks)
-        agg._pool_tasks.clear()
-        raise RuntimeError(
-            f"test left pool task(s) running: {leaked} — cancel and await "
-            "them in the test itself before returning"
-        )
-    retry, agg._retry_task = agg._retry_task, None
-    agg._pending_discovery.clear()
-    agg._file_backend_names.clear()
-    if retry is not None and not retry.done():
-        raise RuntimeError(
-            "test left the discovery retry task running — cancel and await "
-            "it in the test itself before returning"
-        )
+    for name in list(agg._states):
+        await agg._remove(name)
+    tasks = [t for t in [agg._retry_task, *agg._background] if t is not None]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    agg._retry_task = None
+    agg._background.clear()
+    agg._listening_connections.clear()
     agg._tool_registry.clear()
     agg._tool_list.clear()
-    agg._backends.clear()
-    agg._session_pool.clear()

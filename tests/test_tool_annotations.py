@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import server as agg
+from conftest import connect
 
 pytestmark = pytest.mark.anyio
 
@@ -29,7 +30,7 @@ async def _tools():
 
 async def test_annotations_are_forwarded(monkeypatch):
     monkeypatch.delenv("AGGREGATOR_READ_ONLY", raising=False)
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
     tools = await _tools()
 
     assert tools["mock__read_value"].annotations.read_only_hint is True
@@ -38,7 +39,7 @@ async def test_annotations_are_forwarded(monkeypatch):
 
 
 async def test_only_explicit_read_only_counts(monkeypatch):
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
     assert agg._tool_registry["mock__read_value"].read_only
     assert not agg._tool_registry["mock__delete_thing"].read_only
     assert not agg._tool_registry["mock__unlabelled"].read_only
@@ -46,7 +47,7 @@ async def test_only_explicit_read_only_counts(monkeypatch):
 
 async def test_full_mode_lists_and_calls_everything(monkeypatch):
     monkeypatch.delenv("AGGREGATOR_READ_ONLY", raising=False)
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
     assert set(await _tools()) == {
         "mock__read_value",
         "mock__delete_thing",
@@ -64,14 +65,14 @@ async def test_full_mode_lists_and_calls_everything(monkeypatch):
 @pytest.mark.parametrize("value", ["1", "true", "YES"])
 async def test_read_only_mode_hides_writes(monkeypatch, value):
     monkeypatch.setenv("AGGREGATOR_READ_ONLY", value)
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
     assert set(await _tools()) == {"mock__read_value"}
 
 
 @pytest.mark.parametrize("tool", ["mock__delete_thing", "mock__unlabelled"])
 async def test_read_only_mode_refuses_write_calls(monkeypatch, tool):
     monkeypatch.setenv("AGGREGATOR_READ_ONLY", "1")
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
 
     params = agg.types.CallToolRequestParams(name=tool, arguments={"tag": "x"})
     result = await agg._handle_call_tool(None, params)
@@ -81,7 +82,7 @@ async def test_read_only_mode_refuses_write_calls(monkeypatch, tool):
 
 async def test_read_only_mode_still_serves_reads(monkeypatch):
     monkeypatch.setenv("AGGREGATOR_READ_ONLY", "1")
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
 
     params = agg.types.CallToolRequestParams(
         name="mock__read_value", arguments={"tag": "t"}

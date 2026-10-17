@@ -143,11 +143,11 @@ def _management():
 
 async def test_add_backend_refuses_stdio(monkeypatch):
     called = []
-    monkeypatch.setattr(server, "_discover_backend", lambda b: called.append(b))
+    monkeypatch.setattr(server, "_activate", lambda s: called.append(s))
     body = {"name": "x", "transport": "stdio", "command": "powershell", "args": []}
     response = _management().post("/backends", json=body)
     assert response.status_code == 403
-    assert called == []
+    assert called == [] and "x" not in server._states
 
 
 @pytest.mark.parametrize(

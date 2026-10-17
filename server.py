@@ -1,20 +1,24 @@
 """MCP Aggregator — single endpoint that proxies multiple backend MCP servers.
 
-Startup: reads backends.json, connects to each backend, calls tools/list,
-prefixes every tool as {backend_name}__{tool_name}, then serves them all from one
-endpoint on port 8100.
+Startup: reads backends.json, discovers every backend's tools at once (each
+within DISCOVERY_TIMEOUT_S), prefixes every tool as {backend_name}__{tool_name},
+then serves them all from one endpoint on port 8100. A backend that doesn't
+answer is retried in the background; its tools appear once it does, and
+connected clients are told the tool list changed.
 
 Runtime: each tool call is routed to the originating backend. Streamable HTTP
 and stdio backends use a persistent pooled session (stdio subprocesses can't be
 respawned per call — a "connect" tool call establishes state later calls depend
-on); SSE backends open a fresh connection per call.
+on). A call to a pooled backend whose session is down waits up to POOL_WAIT_S
+for it to come back, then reports the backend as reconnecting. SSE backends
+open a fresh connection per call.
 
 Serves two transports on the same port:
   GET/POST /mcp  — Streamable HTTP (Claude Desktop, modern MCP clients)
   GET      /sse  — Legacy SSE (older clients, custom chat UIs)
 
 Management API (same token rule as the MCP endpoints, see "Network access" below):
-  GET    /backends         — list active backends and tool counts
+  GET    /backends         — list backends: status, tool counts, last error
   POST   /backends         — add a backend at runtime
   DELETE /backends/{name}  — remove a backend at runtime
   POST   /backends/reload  — re-read backends.json and reconcile
@@ -44,21 +48,31 @@ import json
 import logging
 import os
 import sys
+import time
+import weakref
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+import anyio
 import httpx2
 import uvicorn
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from dotenv import load_dotenv
 from mcp import ClientSession, types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import Server
+from mcp.server.connection import Connection
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.server.session import ServerSession
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import (
     StreamableHTTPASGIApp,
     StreamableHTTPSessionManager,
 )
+from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
+from mcp.shared.subscriptions import ToolsListChanged
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -71,6 +85,15 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("mcp-aggregator")
+
+_POOLED_TRANSPORTS = ("streamable_http", "stdio")
+
+# Timeouts. Discovery is bounded so a backend that accepts the connection and
+# then hangs can't hold up startup or a reload. A pooled backend whose session
+# is down gets POOL_WAIT_S to come back before a call to it is refused.
+DISCOVERY_TIMEOUT_S = 15.0
+CALL_TIMEOUT_S = 60.0
+POOL_WAIT_S = 5.0
 
 
 @dataclass
@@ -86,14 +109,69 @@ class BackendEntry:
     read_only: bool = False
 
 
+@dataclass(eq=False)
+class BackendState:
+    """Everything the aggregator knows about one backend.
+
+    config is the entry as given. source is where it came from: "file" (the
+    backends file, which reload reconciles) or "api" (POST /backends, which
+    reload leaves alone unless the file now names it). status is "pending"
+    until discovery succeeds, then "ready". A pooled backend also has a pool
+    task keeping one session open; session is that session while it's up,
+    and session_ready is set while it is.
+    """
+
+    config: dict
+    source: str
+    status: str = "pending"
+    tools: int = 0
+    last_error: str | None = None
+    last_attempt: float | None = None  # wall-clock time of the last discovery
+    last_attempt_s: float | None = None  # and how long it took
+    pool_task: asyncio.Task | None = None
+    session: ClientSession | None = None
+    session_ready: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def name(self) -> str:
+        return self.config["name"]
+
+    @property
+    def transport(self) -> str:
+        return self.config.get("transport", "sse")
+
+    @property
+    def pooled(self) -> bool:
+        return self.transport in _POOLED_TRANSPORTS
+
+
 _tool_registry: dict[str, BackendEntry] = {}
 _tool_list: list[types.Tool] = []
-_backends: dict[str, dict] = {}  # name -> raw config, for management API
 _registry_lock = asyncio.Lock()
-_session_pool: dict[str, ClientSession] = {}  # pooled (streamable_http, stdio) backends
-_pool_tasks: dict[str, asyncio.Task] = {}
+_states: dict[str, BackendState] = {}  # by backend name
 _shutdown_event = asyncio.Event()
 _backends_path: str = ""  # set in main(), used by reload endpoint
+
+
+def _reason(exc: BaseException) -> str:
+    """The real error(s) as text, from inside anyio's exception groups.
+
+    Everything raised inside a ClientSession arrives wrapped, and the group's
+    own message is only "unhandled errors in a TaskGroup (1 sub-exception)".
+    """
+    leaves: list[BaseException] = []
+
+    def collect(e: BaseException) -> None:
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                collect(sub)
+        else:
+            leaves.append(e)
+
+    collect(exc)
+    return "; ".join(
+        f"{type(e).__name__}: {e}" if str(e) else type(e).__name__ for e in leaves
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +221,19 @@ async def _make_client(
             yield read, write
 
 
+def _client_for(config: dict, **kwargs):
+    return _make_client(
+        config.get("transport", "sse"),
+        url=config.get("url"),
+        command=config.get("command"),
+        args=config.get("args"),
+        env=config.get("env"),
+        **kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Discovery
+# Configuration checks
 # ---------------------------------------------------------------------------
 
 
@@ -175,6 +264,10 @@ def check_backend(backend) -> None:
     needed = "command" if transport == "stdio" else "url"
     if not backend.get(needed):
         raise ValueError(f"backend '{name}': transport {transport} needs a {needed}")
+    if backend.get("include_tools") and backend.get("exclude_tools"):
+        raise ValueError(
+            f"backend '{name}': include_tools and exclude_tools are mutually exclusive"
+        )
 
 
 def check_backends(backends) -> None:
@@ -195,118 +288,208 @@ def _backend_desc(backend: dict) -> str:
     return backend.get("url", "")
 
 
-async def _discover_backend(backend: dict) -> int:
-    check_backend(backend)
-    name = backend["name"]
-    transport = backend.get("transport", "sse")
-    url = backend.get("url")
-    command = backend.get("command")
-    args = backend.get("args")
-    env = backend.get("env")
+# ---------------------------------------------------------------------------
+# Backend lifecycle
+#
+# Every change goes through these functions: _add, _activate (discover, then
+# start the pool), _remove, and _reload for the backends file. They keep
+# _states, the tool registry and the pool tasks in step, and tell clients
+# whenever the tool list changes.
+# ---------------------------------------------------------------------------
 
-    include = set(backend.get("include_tools") or [])
-    exclude = set(backend.get("exclude_tools") or [])
-    if include and exclude:
-        raise ValueError(
-            f"Backend '{name}': include_tools and exclude_tools are mutually exclusive"
+
+def _add(config: dict, source: str) -> BackendState:
+    """Record a checked backend. It has no tools until _activate succeeds."""
+    state = BackendState(config=config, source=source)
+    _states[state.name] = state
+    return state
+
+
+async def _discover(state: BackendState) -> int:
+    """List the backend's tools and register them in place of any it had.
+
+    Raises when the backend can't be reached or doesn't answer within
+    DISCOVERY_TIMEOUT_S, recording why in state.last_error.
+    """
+    config, name = state.config, state.name
+    started = time.monotonic()
+    state.last_attempt = time.time()
+    try:
+        with anyio.fail_after(DISCOVERY_TIMEOUT_S):
+            async with _client_for(config, timeout=10) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = (await session.list_tools()).tools
+    except Exception as e:
+        state.last_attempt_s = time.monotonic() - started
+        state.last_error = _reason(e)
+        if isinstance(e, TimeoutError):
+            state.last_error = f"no answer within {DISCOVERY_TIMEOUT_S:g}s"
+        raise RuntimeError(state.last_error) from e
+    state.last_attempt_s = time.monotonic() - started
+
+    include = set(config.get("include_tools") or [])
+    exclude = set(config.get("exclude_tools") or [])
+    default_args: dict = config.get("default_args") or {}
+    registered = 0
+    async with _registry_lock:
+        if _states.get(name) is not state:  # removed or replaced meanwhile
+            return 0
+        # Replace, never duplicate: reload and the retry can both discover it.
+        _purge_tools(name)
+        for tool in tools:
+            if include and tool.name not in include:
+                continue
+            if exclude and tool.name in exclude:
+                continue
+            prefixed = f"{name}__{tool.name}"
+            _tool_registry[prefixed] = BackendEntry(
+                backend_name=name,
+                original_name=tool.name,
+                default_args=default_args,
+                transport=state.transport,
+                url=config.get("url"),
+                command=config.get("command"),
+                args=config.get("args"),
+                env=config.get("env"),
+                read_only=_is_read_only(tool),
+            )
+            _tool_list.append(
+                types.Tool(
+                    name=prefixed,
+                    description=f"[{name}] {tool.description or ''}".strip(),
+                    input_schema=tool.input_schema,
+                    # Forward safety hints so clients can gate writes.
+                    annotations=tool.annotations,
+                    # And the shape of structuredContent, which call
+                    # results already carry through unchanged.
+                    output_schema=tool.output_schema,
+                )
+            )
+            registered += 1
+        state.status, state.tools, state.last_error = "ready", registered, None
+    logger.info(
+        "Discovered %d tool(s) from '%s' in %.1fs",
+        registered,
+        name,
+        state.last_attempt_s,
+    )
+    _tools_changed()
+    return registered
+
+
+async def _activate(state: BackendState) -> bool:
+    """Discover the backend and, once it answers, start its pool.
+
+    Returns False, with the reason in state.last_error, if it didn't answer.
+    """
+    logger.info(
+        "Discovering tools from '%s' at %s", state.name, _backend_desc(state.config)
+    )
+    try:
+        await _discover(state)
+    except Exception:
+        logger.warning(
+            "Backend '%s' unreachable after %.1fs: %s",
+            state.name,
+            state.last_attempt_s or 0,
+            state.last_error,
         )
-
-    default_args: dict = backend.get("default_args") or {}
-
-    async with _make_client(
-        transport, url=url, command=command, args=args, env=env, timeout=10
-    ) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.list_tools()
-            registered = 0
-            async with _registry_lock:
-                # Replace, never duplicate: reload and the startup retry can
-                # both discover the same backend.
-                _purge_tools(name)
-                _backends[name] = backend
-                for tool in result.tools:
-                    if include and tool.name not in include:
-                        continue
-                    if exclude and tool.name in exclude:
-                        continue
-                    prefixed = f"{name}__{tool.name}"
-                    _tool_registry[prefixed] = BackendEntry(
-                        backend_name=name,
-                        original_name=tool.name,
-                        default_args=default_args,
-                        transport=transport,
-                        url=url,
-                        command=command,
-                        args=args,
-                        env=env,
-                        read_only=_is_read_only(tool),
-                    )
-                    _tool_list.append(
-                        types.Tool(
-                            name=prefixed,
-                            description=f"[{name}] {tool.description or ''}".strip(),
-                            input_schema=tool.input_schema,
-                            # Forward safety hints so clients can gate writes.
-                            annotations=tool.annotations,
-                            # And the shape of structuredContent, which call
-                            # results already carry through unchanged.
-                            output_schema=tool.output_schema,
-                        )
-                    )
-                    logger.info("  registered: %s", prefixed)
-                    registered += 1
-            return registered
+        return False
+    if state.pooled and state.pool_task is None and _states.get(state.name) is state:
+        state.pool_task = asyncio.create_task(_run_persistent_pool(state))
+    return True
 
 
-async def discover_all(backends: list[dict]) -> list[dict]:
-    """Discover every backend once. Returns the ones that couldn't be reached."""
-    failed = []
-    for backend in backends:
-        name = backend["name"]
-        desc = _backend_desc(backend)
-        logger.info("Discovering tools from '%s' at %s", name, desc)
-        try:
-            count = await _discover_backend(backend)
-            logger.info("  %d tool(s) from '%s'", count, name)
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.error("Failed to reach backend '%s' (%s): %s", name, desc, e)
-            failed.append(backend)
+async def _activate_all(states: list[BackendState]) -> list[BackendState]:
+    """Activate backends concurrently; retry the ones that didn't answer.
+
+    Returns those, which stay pending until the retry reaches them.
+    """
+    answered = await asyncio.gather(*(_activate(s) for s in states))
+    failed = [s for s, ok in zip(states, answered) if not ok]
+    if failed:
+        _ensure_retry()
     return failed
 
 
-# Backends from the backends file that failed discovery and are still being
-# retried, by name, and the names the file lists now (main() and reload set
-# both). Reload drops a pending name that leaves the file.
-_pending_discovery: dict[str, dict] = {}
-_file_backend_names: set[str] = set()
+async def _remove(name: str) -> int:
+    """Forget a backend: its tools, its pool and its state. Returns the tool count."""
+    state = _states.pop(name, None)
+    async with _registry_lock:
+        removed = _purge_tools(name)
+    if state is not None and state.pool_task is not None:
+        state.pool_task.cancel()
+        try:
+            await state.pool_task
+        except asyncio.CancelledError:
+            pass
+    if removed:
+        _tools_changed()
+    return removed
+
+
+def _purge_tools(name: str) -> int:
+    """Drop a backend's tools from the registry. Caller holds _registry_lock."""
+    keys = {k for k, e in _tool_registry.items() if e.backend_name == name}
+    for k in keys:
+        del _tool_registry[k]
+    _tool_list[:] = [t for t in _tool_list if t.name not in keys]
+    return len(keys)
+
+
+async def _reload(entries: list[dict]) -> dict:
+    """Make the file's backends match entries, which check_backends has passed.
+
+    A file backend no longer listed is removed; one whose entry changed is
+    replaced; new ones are added. Backends added through POST /backends stay,
+    unless the file now names one, which the file's entry then replaces.
+    """
+    desired = {e["name"]: e for e in entries}
+    removed_tools = 0
+    for name, state in list(_states.items()):
+        if name in desired:
+            if state.source != "file" or state.config != desired[name]:
+                removed_tools += await _remove(name)
+                logger.info("Management: reload replaces backend '%s'", name)
+        elif state.source == "file":
+            removed_tools += await _remove(name)
+            logger.info("Management: reload removed backend '%s'", name)
+    new = [_add(cfg, "file") for name, cfg in desired.items() if name not in _states]
+    failed = await _activate_all(new)
+    return {
+        "added_tools": sum(s.tools for s in new),
+        "removed_tools": removed_tools,
+        "errors": [{"backend": s.name, "error": s.last_error} for s in failed],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Retrying backends that didn't answer
+# ---------------------------------------------------------------------------
+
+
 _retry_task: asyncio.Task | None = None
 _RETRY_MIN_S = 2.0
 _RETRY_MAX_S = 60.0
 
 
-def _queue_retry(backends: list[dict]) -> None:
-    """Retry these backends in the background until each one answers."""
+def _ensure_retry() -> None:
     global _retry_task
-    for backend in backends:
-        _pending_discovery[backend["name"]] = backend
-    if _pending_discovery and (_retry_task is None or _retry_task.done()):
+    if _retry_task is None or _retry_task.done():
         _retry_task = asyncio.create_task(_retry_pending_backends())
 
 
 async def _retry_pending_backends() -> None:
-    """Retry backends that failed discovery until each one answers.
+    """Retry pending backends until each one answers.
 
     As Windows services, a backend can still be starting when the aggregator
-    discovers tools (a service counts as started before it listens), and
-    discovery used to run only once, leaving that backend's tools missing
-    until a restart. Backs off from 2 s to 60 s; exits once nothing is
-    pending or on shutdown.
+    discovers tools (a service counts as started before it listens). Backs
+    off from 2 s to 60 s; exits once nothing is pending, or on shutdown. A
+    backend removed meanwhile is no longer in _states, so it isn't retried.
     """
     delay = _RETRY_MIN_S
-    while _pending_discovery:
+    while any(s.status == "pending" for s in _states.values()):
         try:
             await asyncio.wait_for(
                 asyncio.shield(_shutdown_event.wait()), timeout=delay
@@ -314,33 +497,8 @@ async def _retry_pending_backends() -> None:
             return
         except asyncio.TimeoutError:
             pass
-        for name, backend in list(_pending_discovery.items()):
-            if name in _backends:  # added meanwhile by reload or POST /backends
-                _pending_discovery.pop(name, None)
-                continue
-            try:
-                count = await _discover_backend(backend)
-            except Exception as e:
-                logger.warning(
-                    "Backend '%s' still unreachable, retrying in up to %.0fs: %s",
-                    name,
-                    min(delay * 2, _RETRY_MAX_S),
-                    e,
-                )
-                continue
-            _pending_discovery.pop(name, None)
-            # Reload may have dropped it from the file while discovery ran.
-            if name not in _file_backend_names:
-                await _remove_backend(name)
-                continue
-            logger.info("Backend '%s' reachable on retry: %d tool(s)", name, count)
-            if (
-                backend.get("transport") in _POOLED_TRANSPORTS
-                and name not in _pool_tasks
-            ):
-                _pool_tasks[name] = asyncio.create_task(
-                    _run_persistent_pool(name, backend)
-                )
+        pending = [s for s in _states.values() if s.status == "pending"]
+        await asyncio.gather(*(_activate(s) for s in pending))
         delay = min(delay * 2, _RETRY_MAX_S)
 
 
@@ -353,55 +511,93 @@ async def _retry_pending_backends() -> None:
 # asyncio.Queue to serialize calls onto the single open stream.
 # ---------------------------------------------------------------------------
 
-_POOLED_TRANSPORTS = ("streamable_http", "stdio")
 
-
-async def _run_persistent_pool(name: str, backend: dict) -> None:
-    """Keep one persistent ClientSession open for a backend that needs
-    connection state preserved across calls (Streamable HTTP, stdio).
+async def _run_persistent_pool(state: BackendState) -> None:
+    """Keep one persistent ClientSession open for a pooled backend.
 
     Reconnects automatically on drop (HTTP) or respawns the subprocess
-    (stdio). Exits cleanly when _shutdown_event fires.
+    (stdio). Exits when cancelled or when _shutdown_event fires.
     """
-    transport = backend.get("transport", "sse")
     backoff = 2.0
     while True:
         try:
-            async with _make_client(
-                transport,
-                url=backend.get("url"),
-                command=backend.get("command"),
-                args=backend.get("args"),
-                env=backend.get("env"),
-            ) as (read, write):
+            async with _client_for(state.config) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    _session_pool[name] = session
-                    logger.info("Pool ready: '%s' (%s)", name, transport)
+                    state.session = session
+                    state.session_ready.set()
+                    logger.info("Pool ready: '%s' (%s)", state.name, state.transport)
                     await _shutdown_event.wait()
                     return
         except asyncio.CancelledError:
             return
         except Exception as e:
-            _session_pool.pop(name, None)
             logger.warning(
-                "Pool '%s' dropped, reconnecting in %.0fs: %s", name, backoff, e
+                "Pool '%s' dropped, reconnecting in %.0fs: %s",
+                state.name,
+                backoff,
+                _reason(e),
             )
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(_shutdown_event.wait()), timeout=backoff
+        finally:
+            state.session = None
+            state.session_ready.clear()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(_shutdown_event.wait()), timeout=backoff
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Telling clients the tool list changed
+#
+# Clients on the initialize handshake hear it as notifications/tools/list_changed
+# on their session (the aggregator remembers every session that lists tools).
+# Clients on the 2026-07-28 protocol hear it on a subscriptions/listen stream.
+# ---------------------------------------------------------------------------
+
+
+_subscriptions = InMemorySubscriptionBus()
+_listening_connections: "weakref.WeakSet[Connection]" = weakref.WeakSet()
+_background: set[asyncio.Task] = set()
+NOTIFY_TIMEOUT_S = 2.0
+
+
+def _remember_listener(session: ServerSession) -> None:
+    """Remember the client connection a tools/list came in on.
+
+    ctx.session is a new ServerSession for every request; the connection
+    under it is what lasts, and what a notification outside any request goes
+    out on (ServerSession._notify does the same). mcp exposes it only as
+    _connection; the tests cover it, and requirements.txt pins mcp.
+    """
+    connection = getattr(session, "_connection", None)
+    if connection is not None:
+        _listening_connections.add(connection)
+
+
+def _tools_changed() -> None:
+    """Tell every connected client, without holding up the change itself."""
+    task = asyncio.create_task(_notify_tools_changed())
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def _notify_tools_changed() -> None:
+    try:
+        await _subscriptions.publish(ToolsListChanged())
+    except Exception as e:
+        logger.warning("Could not publish the tool list change: %s", _reason(e))
+    for connection in list(_listening_connections):
+        try:
+            with anyio.fail_after(NOTIFY_TIMEOUT_S):
+                await connection.outbound.notify(
+                    "notifications/tools/list_changed", None
                 )
-                return
-            except asyncio.TimeoutError:
-                pass
-
-
-async def _start_pool_tasks(backends: list[dict]) -> None:
-    for backend in backends:
-        if backend.get("transport") in _POOLED_TRANSPORTS:
-            name = backend["name"]
-            task = asyncio.create_task(_run_persistent_pool(name, backend))
-            _pool_tasks[name] = task
+        except Exception:
+            _listening_connections.discard(connection)  # gone, or not reading
 
 
 # ---------------------------------------------------------------------------
@@ -413,30 +609,31 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
     entry = _tool_registry[prefixed_name]
     merged = {**entry.default_args, **arguments}
 
-    session = _session_pool.get(entry.backend_name)
-    if session is not None:
-        return await session.call_tool(entry.original_name, merged)
+    if entry.transport in _POOLED_TRANSPORTS:
+        # Never a one-off connection: a stdio backend's state (e.g. what a
+        # "connect" tool set up) lives in its pooled process.
+        state = _states.get(entry.backend_name)
+        if state is not None and state.session is None:
+            with anyio.move_on_after(POOL_WAIT_S):
+                await state.session_ready.wait()
+        session = state.session if state is not None else None
+        if session is None:
+            raise RuntimeError(
+                f"backend '{entry.backend_name}' is reconnecting; try again shortly"
+            )
+        return await session.call_tool(
+            entry.original_name, merged, read_timeout_seconds=CALL_TIMEOUT_S
+        )
 
-    # SSE backends, or pooled backends whose pool session isn't ready yet
     async with _make_client(
         entry.transport,
         url=entry.url,
-        command=entry.command,
-        args=entry.args,
-        env=entry.env,
         timeout=5,
-        read_timeout=60,
+        read_timeout=CALL_TIMEOUT_S,
     ) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             return await session.call_tool(entry.original_name, merged)
-
-
-# mcp 2.0's low-level Server registers request handlers as constructor
-# kwargs (on_list_tools / on_call_tool) instead of decorators applied after
-# construction — these have to exist before Server(...) is called, so they
-# live at module level rather than nested inside main() like their
-# decorator-based predecessors were.
 
 
 def _is_read_only(tool: types.Tool) -> bool:
@@ -457,11 +654,13 @@ def _read_only_mode() -> bool:
 
 
 async def _handle_list_tools(ctx, params) -> types.ListToolsResult:
+    if ctx is not None:
+        _remember_listener(ctx.session)
     if _read_only_mode():
         return types.ListToolsResult(
             tools=[t for t in _tool_list if _tool_registry[t.name].read_only]
         )
-    return types.ListToolsResult(tools=_tool_list)
+    return types.ListToolsResult(tools=list(_tool_list))
 
 
 async def _handle_call_tool(
@@ -488,11 +687,36 @@ async def _handle_call_tool(
     try:
         return await _proxy_call(name, arguments)
     except Exception as e:
-        logger.error("Tool call failed — %s: %s", name, e)
+        reason = _reason(e)
+        logger.error("Tool call failed — %s: %s", name, reason)
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"Backend error: {e}")],
+            content=[types.TextContent(type="text", text=f"Backend error: {reason}")],
             isError=True,
         )
+
+
+class _AggregatorServer(Server):
+    """Advertises tools.listChanged to clients on the initialize handshake.
+
+    Every transport builds its initialize result from
+    create_initialization_options(), which otherwise leaves the flag off.
+    """
+
+    def create_initialization_options(self, notification_options=None, *args, **kwargs):
+        return super().create_initialization_options(
+            notification_options or NotificationOptions(tools_changed=True),
+            *args,
+            **kwargs,
+        )
+
+
+def build_server() -> Server:
+    return _AggregatorServer(
+        "mcp-aggregator",
+        on_list_tools=_handle_list_tools,
+        on_call_tool=_handle_call_tool,
+        on_subscriptions_listen=ListenHandler(_subscriptions),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -500,49 +724,34 @@ async def _handle_call_tool(
 # ---------------------------------------------------------------------------
 
 
-def _purge_tools(name: str) -> int:
-    """Drop a backend's tools from the registry. Caller holds _registry_lock."""
-    keys = [k for k in _tool_registry if k.startswith(f"{name}__")]
-    for k in keys:
-        del _tool_registry[k]
-    _tool_list[:] = [t for t in _tool_list if not t.name.startswith(f"{name}__")]
-    return len(keys)
-
-
-async def _remove_backend(name: str) -> int:
-    async with _registry_lock:
-        removed = _purge_tools(name)
-        _backends.pop(name, None)
-
-    task = _pool_tasks.pop(name, None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    _session_pool.pop(name, None)
-
-    return removed
+def _iso(ts: float | None) -> str | None:
+    return (
+        datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
+        if ts
+        else None
+    )
 
 
 async def handle_backends(request: Request) -> JSONResponse:
     if request.method == "GET":
-        async with _registry_lock:
-            counts: dict[str, int] = {}
-            for entry in _tool_registry.values():
-                counts[entry.backend_name] = counts.get(entry.backend_name, 0) + 1
-            result = [
-                {
-                    "name": name,
-                    "url": cfg.get("url"),
-                    "command": cfg.get("command"),
-                    "transport": cfg.get("transport", "sse"),
-                    "tools": counts.get(name, 0),
-                    "pooled": name in _session_pool,
-                }
-                for name, cfg in _backends.items()
-            ]
+        result = [
+            {
+                "name": name,
+                "source": s.source,
+                "status": s.status,
+                "transport": s.transport,
+                "url": s.config.get("url"),
+                "command": s.config.get("command"),
+                "tools": s.tools,
+                "pooled": s.session is not None,
+                "last_error": s.last_error,
+                "last_attempt": _iso(s.last_attempt),
+                "last_attempt_s": (
+                    round(s.last_attempt_s, 2) if s.last_attempt_s is not None else None
+                ),
+            }
+            for name, s in _states.items()
+        ]
         return JSONResponse({"backends": result, "total_tools": len(_tool_registry)})
 
     # POST — add a new backend
@@ -564,37 +773,34 @@ async def handle_backends(request: Request) -> JSONResponse:
             {"error": "stdio backends can only be added through the backends file"},
             status_code=403,
         )
+    try:
+        check_backend(body)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
-    name = body.get("name")
-    if not name:
-        return JSONResponse({"error": "name is required"}, status_code=400)
-    if name in _backends:
+    name = body["name"]
+    if name in _states:
         return JSONResponse(
             {"error": f"Backend '{name}' already exists — remove it first"},
             status_code=409,
         )
 
-    try:
-        count = await _discover_backend(body)
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        return JSONResponse({"error": f"Discovery failed: {e}"}, status_code=502)
+    state = _add(body, "api")
+    if not await _activate(state):
+        error = state.last_error
+        await _remove(name)
+        return JSONResponse({"error": f"Discovery failed: {error}"}, status_code=502)
 
-    if body.get("transport") in _POOLED_TRANSPORTS:
-        task = asyncio.create_task(_run_persistent_pool(name, body))
-        _pool_tasks[name] = task
-
-    logger.info("Management: added backend '%s' (%d tools)", name, count)
-    return JSONResponse({"added": count}, status_code=201)
+    logger.info("Management: added backend '%s' (%d tools)", name, state.tools)
+    return JSONResponse({"added": state.tools}, status_code=201)
 
 
 async def handle_remove_backend(request: Request) -> JSONResponse:
     name = request.path_params["name"]
-    if name not in _backends:
+    if name not in _states:
         return JSONResponse({"error": f"Backend '{name}' not found"}, status_code=404)
 
-    removed = await _remove_backend(name)
+    removed = await _remove(name)
     logger.info("Management: removed backend '%s' (%d tools)", name, removed)
     return JSONResponse({"removed": removed})
 
@@ -618,50 +824,7 @@ async def handle_reload_backends(request: Request) -> JSONResponse:
             {"error": f"Backends file not loaded: {e}"}, status_code=400
         )
 
-    new_names = {b["name"] for b in new_backends}
-    old_names = set(_backends.keys())
-    _file_backend_names.clear()
-    _file_backend_names.update(new_names)
-    for name in set(_pending_discovery) - new_names:
-        del _pending_discovery[name]
-
-    removed_total = 0
-    for name in old_names - new_names:
-        removed_total += await _remove_backend(name)
-        logger.info("Management: reload removed backend '%s'", name)
-
-    added_total = 0
-    errors = []
-    unreachable = []
-    for backend in new_backends:
-        if backend["name"] not in old_names:
-            try:
-                count = await _discover_backend(backend)
-                _pending_discovery.pop(backend["name"], None)
-                added_total += count
-                if (
-                    backend.get("transport") in _POOLED_TRANSPORTS
-                    and backend["name"] not in _pool_tasks
-                ):
-                    task = asyncio.create_task(
-                        _run_persistent_pool(backend["name"], backend)
-                    )
-                    _pool_tasks[backend["name"]] = task
-                logger.info(
-                    "Management: reload added backend '%s' (%d tools)",
-                    backend["name"],
-                    count,
-                )
-            except ValueError as e:  # bad config; retrying won't help
-                errors.append({"backend": backend["name"], "error": str(e)})
-            except Exception as e:
-                errors.append({"backend": backend["name"], "error": str(e)})
-                unreachable.append(backend)
-    _queue_retry(unreachable)
-
-    return JSONResponse(
-        {"added_tools": added_total, "removed_tools": removed_total, "errors": errors}
-    )
+    return JSONResponse(await _reload(new_backends))
 
 
 # ---------------------------------------------------------------------------
@@ -767,10 +930,11 @@ def build_starlette_app(server: Server) -> Starlette:
     # stateless=False kept deliberately, not left over from the mcp 1.x port:
     # StreamableHTTPSessionManager's constructor is unchanged in mcp 2.0 (same
     # param, same default), and every piece of this aggregator's own state
-    # (_tool_registry, _session_pool, _backends, etc.) is a module-level
-    # global, not scoped to any particular client's MCP session — there is no
-    # app-level session affinity here for a stateless mode to threaten. If a
-    # future mcp SDK release removes this parameter entirely (the spec's
+    # (_tool_registry, _states, etc.) is a module-level global, not scoped to
+    # any particular client's MCP session — there is no app-level session
+    # affinity here for a stateless mode to threaten. A stateful session is
+    # also what lets the aggregator send tools/list_changed outside a request.
+    # If a future mcp SDK release removes this parameter entirely (the spec's
     # long-term direction per SEP-2567), revisit then; nothing here forces an
     # earlier change.
     session_manager = StreamableHTTPSessionManager(app=server, stateless=False)
@@ -792,8 +956,9 @@ def build_starlette_app(server: Server) -> Starlette:
         async with session_manager.run():
             yield
         _shutdown_event.set()
-        if _pool_tasks:
-            await asyncio.gather(*_pool_tasks.values(), return_exceptions=True)
+        tasks = [s.pool_task for s in _states.values() if s.pool_task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def fix_accept_header(scope, receive, send):
         """Inject Accept: text/event-stream on GET /mcp when the client omits it.
@@ -859,21 +1024,16 @@ async def main() -> None:
     except ValueError as e:
         raise SystemExit(f"{_backends_path}: {e}") from None
 
-    _file_backend_names.update(b["name"] for b in backends)
-    failed = await discover_all(backends)
-    await _start_pool_tasks([b for b in backends if b not in failed])
-    _queue_retry(failed)
+    failed = await _activate_all([_add(b, "file") for b in backends])
     logger.info(
-        "Ready — %d tool(s) aggregated from %d backend(s)",
+        "Ready — %d tool(s) aggregated from %d backend(s); %d pending: %s",
         len(_tool_list),
-        len(backends),
+        len(backends) - len(failed),
+        len(failed),
+        ", ".join(s.name for s in failed) or "none",
     )
 
-    server = Server(
-        "mcp-aggregator",
-        on_list_tools=_handle_list_tools,
-        on_call_tool=_handle_call_tool,
-    )
+    server = build_server()
 
     if "--stdio" in sys.argv:
         from mcp.server.stdio import stdio_server

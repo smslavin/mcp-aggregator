@@ -61,8 +61,8 @@ async def test_reload_with_a_bad_file_changes_nothing(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(server, "_backends_path", str(path))
     removed = []
-    monkeypatch.setattr(server, "_remove_backend", lambda name: removed.append(name))
-    server._backends["kept"] = {"name": "kept", "url": "http://h/sse"}
+    monkeypatch.setattr(server, "_remove", lambda name: removed.append(name))
+    server._add({"name": "kept", "url": "http://h/sse"}, "file")
     app = Starlette(
         routes=[
             Route("/backends/reload", server.handle_reload_backends, methods=["POST"])
@@ -72,7 +72,7 @@ async def test_reload_with_a_bad_file_changes_nothing(tmp_path, monkeypatch):
     assert (
         response.status_code == 400 and "unknown transport" in response.json()["error"]
     )
-    assert removed == [] and "kept" in server._backends
+    assert removed == [] and "kept" in server._states
 
 
 async def test_adding_a_backend_checks_it_too():

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import server as agg
+from conftest import connect
 
 pytestmark = pytest.mark.anyio
 
@@ -24,7 +25,7 @@ BACKEND = {
 
 
 async def test_output_schema_is_forwarded():
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
     tools = {t.name: t for t in (await agg._handle_list_tools(None, None)).tools}
 
     schema = tools["mock__deployment_view"].output_schema
@@ -33,7 +34,7 @@ async def test_output_schema_is_forwarded():
 
 
 async def test_result_keeps_text_and_structured_content():
-    await agg._discover_backend(BACKEND)
+    await connect(BACKEND)
     params = agg.types.CallToolRequestParams(
         name="mock__deployment_view", arguments={"area": "WTP"}
     )
