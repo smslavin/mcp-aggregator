@@ -1,3 +1,8 @@
-mcp>=2.0
-httpx2
-python-dotenv
+# Exact versions, tested together; raise them on purpose, with the tests passing.
+# mcp matches mqtt-mcp and opcua-mcp. The rest are what the aggregator imports.
+mcp==2.3.0
+anyio==4.15.1
+httpx2==2.13.1
+python-dotenv==1.2.4
+starlette==1.8.0
+uvicorn==0.54.0

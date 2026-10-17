@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import server as agg
+from conftest import connect
 
 FIXTURE = Path(__file__).parent / "fixtures" / "http_mock_backend.py"
 
@@ -78,8 +79,8 @@ def _text(result: agg.types.CallToolResult) -> str:
 @pytest.mark.anyio
 @pytest.mark.parametrize("http_backend", ["sse", "streamable_http"], indirect=True)
 async def test_http_discovery_and_call(http_backend):
-    count = await agg._discover_backend(http_backend)
-    assert count == 2
+    state = await connect(http_backend)
+    assert state.tools == 2 and state.status == "ready"
     entry = agg._tool_registry["httpmock__echo"]
     assert entry.transport == http_backend["transport"]
     assert entry.url == http_backend["url"]
@@ -92,37 +93,17 @@ async def test_http_discovery_and_call(http_backend):
 @pytest.mark.anyio
 @pytest.mark.parametrize("http_backend", ["streamable_http"], indirect=True)
 async def test_streamable_http_persistent_pool_reuses_session(http_backend):
-    await agg._discover_backend(http_backend)
-    task = agg.asyncio.create_task(agg._run_persistent_pool("httpmock", http_backend))
-    agg._pool_tasks["httpmock"] = task
-
-    for _ in range(100):
-        if "httpmock" in agg._session_pool:
-            break
-        await agg.asyncio.sleep(0.05)
-    assert "httpmock" in agg._session_pool
-
-    try:
-        first = await agg._proxy_call("httpmock__call_count", {})
-        second = await agg._proxy_call("httpmock__call_count", {})
-        assert _text(first) == "1"
-        assert _text(second) == "2"
-    finally:
-        # Cancel in this test's own event loop — see conftest.py's note.
-        del agg._pool_tasks["httpmock"]
-        task.cancel()
-        try:
-            await task
-        except agg.asyncio.CancelledError:
-            pass
+    state = await connect(http_backend)
+    assert state.session is not None
+    first = await agg._proxy_call("httpmock__call_count", {})
+    second = await agg._proxy_call("httpmock__call_count", {})
+    assert _text(first) == "1"
+    assert _text(second) == "2"
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("http_backend", ["sse"], indirect=True)
 async def test_sse_backend_not_pooled(http_backend):
-    """SSE backends still open a fresh connection per call — confirm
-    _start_pool_tasks doesn't pool them (unchanged pre-#20 behavior)."""
-    await agg._discover_backend(http_backend)
-    await agg._start_pool_tasks([http_backend])
-    assert "httpmock" not in agg._session_pool
-    assert "httpmock" not in agg._pool_tasks
+    """SSE backends still open a fresh connection per call."""
+    state = await connect(http_backend)
+    assert state.pool_task is None and state.session is None

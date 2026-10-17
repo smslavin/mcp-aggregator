@@ -23,9 +23,9 @@ Tools are prefixed `{backend_name}__{tool_name}`. With backends named `opcua` an
 `plant`, the aggregated namespace looks like:
 
 ```
-opcua__connect_server
 opcua__browse_nodes
-opcua__read_node
+opcua__read_nodes
+opcua__search_nodes
 ...
 plant__get_plant_status
 plant__list_sensors
@@ -42,20 +42,29 @@ Every tool call identifies both the domain and the operation.
 
 ## How it works
 
-**Startup:** for each backend in `backends.json`, connects to the backend and calls
-`tools/list`. Every discovered tool is registered with a `{backend}__{tool}` prefix so
-the routing is explicit and collision-free. Streamable HTTP backends also start a
-persistent pooled session at this point.
+**Startup:** connects to every backend in `backends.json` at once and calls
+`tools/list`, giving each 15 s to answer. Every discovered tool is registered with a
+`{backend}__{tool}` prefix so the routing is explicit and collision-free. Streamable
+HTTP and stdio backends also start a persistent pooled session once they answer.
 
 A backend that can't be reached at startup, such as a Windows service still
 starting, is retried in the background every 2 s, backing off to 60 s, until it
 answers; its tools then appear without a restart. `POST /backends/reload` hands
-backends it can't reach to the same retry. Clients that cached the tool list
-need to list tools again to see them.
+backends it can't reach to the same retry. `GET /backends` shows each one's status
+and last error while it waits.
+
+Whenever the tool list changes (a backend answers, is added, reloaded or removed),
+the aggregator tells connected clients: `notifications/tools/list_changed` for
+clients on the initialize handshake (it advertises `tools.listChanged`), and a
+`subscriptions/listen` event for clients on the 2026-07-28 protocol.
 
 **Runtime:** each tool call is routed to the originating backend. Streamable HTTP
-backends use the persistent pooled session; SSE backends open a fresh connection per
-call. The aggregator adds no parsing or transformation — it is a transparent proxy.
+and stdio backends use the persistent pooled session; a call made while it is
+reconnecting waits up to 5 s for it, then reports the backend as reconnecting. SSE
+backends open a fresh connection per call. Calls give up after 60 s. The aggregator
+adds no parsing or transformation — it is a transparent proxy. A backend error
+reaches the client with its real message, not anyio's "unhandled errors in a
+TaskGroup".
 
 ## Setup
 
@@ -184,13 +193,13 @@ at the same server but restricting each to a different topic namespace:
   {
     "name": "mqtt_rawwater",
     "url": "http://localhost:8001/sse",
-    "include_tools": ["read_topic_value", "scan_topics"],
+    "include_tools": ["read_topics", "scan_topics"],
     "default_args": { "topic_filter": "Plant/WTP/Pump/RawWater_*" }
   },
   {
     "name": "mqtt_treated",
     "url": "http://localhost:8001/sse",
-    "include_tools": ["read_topic_value", "scan_topics"],
+    "include_tools": ["read_topics", "scan_topics"],
     "default_args": { "topic_filter": "Plant/WTP/Pump/Treated_*" }
   }
 ]
@@ -229,8 +238,9 @@ The aggregator spawns the subprocess and keeps it running for the aggregator's
 lifetime — like Streamable HTTP, stdio backends use the persistent connection pool
 rather than spawning a fresh process per call, since many adapters expose an explicit
 `connect` tool that establishes state later calls depend on. If the pool session isn't
-ready yet (or drops), a call falls back to briefly spawning its own subprocess for that
-one call, then the pool reconnects on its own.
+ready yet (or drops), a call waits up to 5 s for it and otherwise fails with "backend
+is reconnecting"; it never runs in a one-off process, which would lack that state. The
+pool reconnects on its own.
 
 ## Network access
 
@@ -298,14 +308,13 @@ AGGREGATOR_ALLOWED_ORIGINS=http://localhost:6274
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/backends` | List active backends, tool counts, pool status |
+| `GET` | `/backends` | List backends: `source` (file or api), `status` (pending or ready), tool count, pool status, `last_error`, and when the last discovery ran and how long it took |
 | `POST` | `/backends` | Add a backend (same JSON shape as a backends.json entry) |
 | `DELETE` | `/backends/{name}` | Remove a backend and deregister its tools |
-| `POST` | `/backends/reload` | Re-read backends.json, add new entries, remove gone ones |
+| `POST` | `/backends/reload` | Re-read backends.json: add new entries, replace changed ones, remove gone ones. Backends added through `POST /backends` stay, unless the file names one |
 
-**Note:** MCP clients (including Claude Desktop) call `tools/list` once at connect
-time and cache the result. Adding or removing a backend takes effect for new client
-connections but won't be visible to already-connected clients until they reconnect.
+Connected clients are told when the tool list changes (see "How it works"). A client
+that ignores the notification sees the change the next time it lists tools.
 
 ### Example: add a backend at runtime
 
@@ -328,8 +337,8 @@ Omit the `Authorization` header if no token is set.
 ## Running as a Windows service
 
 The aggregator can run as an auto-start Windows service via [NSSM](https://nssm.cc/download).
-Start the three backend MCP servers before starting the aggregator — tool discovery runs at
-startup and backends that are unreachable at that point will not have their tools registered.
+The service depends on no backend service: a backend that isn't up yet is retried until it
+answers, and its tools then appear.
 
 ```powershell
 # Install (run as Administrator)
