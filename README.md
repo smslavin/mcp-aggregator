@@ -53,7 +53,16 @@ answers; its tools then appear without a restart. `POST /backends/reload` hands
 backends it can't reach to the same retry. `GET /backends` shows each one's status
 and last error while it waits.
 
-Whenever the tool list changes (a backend answers, is added, reloaded or removed),
+A backend that is already up is listed once. After one restarts with new or changed
+tools, `POST /backends/{name}/refresh` (or `POST /backends/refresh` for all) lists it
+again; a product's installer can call it after restarting its server. A backend that
+doesn't answer the refresh keeps the tools it had. A pooled backend is also listed
+again whenever its session reconnects, and whenever it sends
+`notifications/tools/list_changed`. When a call finds a restarted Streamable HTTP
+backend no longer knows the pool's session, the pool reconnects at once and the call is
+sent again: the backend refused it without running it.
+
+Whenever the tool list changes (a backend answers, is added, refreshed, reloaded or removed),
 the aggregator tells connected clients: `notifications/tools/list_changed` for
 clients on the initialize handshake (it advertises `tools.listChanged`), and a
 `subscriptions/listen` event for clients on the 2026-07-28 protocol.
@@ -311,6 +320,8 @@ AGGREGATOR_ALLOWED_ORIGINS=http://localhost:6274
 | `GET` | `/backends` | List backends: `source` (file or api), `status` (pending or ready), tool count, pool status, `last_error`, and when the last discovery ran and how long it took |
 | `POST` | `/backends` | Add a backend (same JSON shape as a backends.json entry) |
 | `DELETE` | `/backends/{name}` | Remove a backend and deregister its tools |
+| `POST` | `/backends/{name}/refresh` | List the backend's tools again. Answers `added` and `removed` tool names; `502` with `error` if it didn't answer, when it keeps its tools |
+| `POST` | `/backends/refresh` | The same for every backend |
 | `POST` | `/backends/reload` | Re-read backends.json: add new entries, replace changed ones, remove gone ones. Backends added through `POST /backends` stay, unless the file names one |
 
 Connected clients are told when the tool list changes (see "How it works"). A client
@@ -323,6 +334,12 @@ curl -X POST http://localhost:8100/backends \
   -H "Authorization: Bearer $AGGREGATOR_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "historian", "url": "http://192.168.1.50:8005/sse"}'
+```
+
+### Example: list a restarted backend's tools again
+
+```bash
+curl -X POST http://localhost:8100/backends/mes/refresh   -H "Authorization: Bearer $AGGREGATOR_AUTH_TOKEN"
 ```
 
 ### Example: reload from backends.json

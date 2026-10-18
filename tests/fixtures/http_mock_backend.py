@@ -5,6 +5,7 @@ Spawned as a subprocess by tests, never run directly by a human."""
 import argparse
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 
 mcp = MCPServer("http-mock-backend")
 
@@ -27,11 +28,30 @@ def call_count() -> int:
 
 call_count.calls = 0
 
+
+def extra() -> str:
+    """A tool this backend has only when started with --extra, or after grow."""
+    return "extra"
+
+
+async def grow(ctx: Context) -> str:
+    """Add the extra tool and tell the client its tool list changed."""
+    mcp.add_tool(extra)
+    await ctx.session.send_tool_list_changed()
+    return "grown"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--transport", choices=["sse", "streamable-http"], required=True
     )
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--extra", action="store_true", help="start with the extra tool")
+    parser.add_argument("--grow", action="store_true", help="offer grow, which adds it later")
     args = parser.parse_args()
+    if args.extra:
+        mcp.add_tool(extra)
+    if args.grow:
+        mcp.add_tool(grow)
     mcp.run(args.transport, port=args.port)
