@@ -22,6 +22,10 @@ Management API (same token rule as the MCP endpoints, see "Network access" below
   POST   /backends         — add a backend at runtime
   DELETE /backends/{name}  — remove a backend at runtime
   POST   /backends/reload  — re-read backends.json and reconcile
+  POST   /backends/{name}/refresh — list a backend's tools again, e.g. after
+                           it restarted with new ones; it keeps its tools if
+                           it doesn't answer
+  POST   /backends/refresh — the same for every backend
 
 Network access:
   AGGREGATOR_BIND_HOST   Default 127.0.0.1. A non-loopback address requires
@@ -58,7 +62,7 @@ import anyio
 import httpx2
 import uvicorn
 from dotenv import load_dotenv
-from mcp import ClientSession, types
+from mcp import ClientSession, MCPError, types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -131,6 +135,8 @@ class BackendState:
     pool_task: asyncio.Task | None = None
     session: ClientSession | None = None
     session_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set when a call finds the backend no longer knows the pool's session.
+    reconnect: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
     def name(self) -> str:
@@ -305,21 +311,38 @@ def _add(config: dict, source: str) -> BackendState:
     return state
 
 
+async def _list_tools(state: BackendState) -> list[types.Tool]:
+    """The backend's tools, over its pooled session while that is up.
+
+    Otherwise over a connection of its own: for a stdio backend, a process
+    of its own, as at startup.
+    """
+    if state.session is not None:
+        return (await state.session.list_tools()).tools
+    async with _client_for(state.config, timeout=10) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return (await session.list_tools()).tools
+
+
+def _backend_tools(name: str) -> list[types.Tool]:
+    """The tools registered for a backend. Caller holds _registry_lock."""
+    return [t for t in _tool_list if _tool_registry[t.name].backend_name == name]
+
+
 async def _discover(state: BackendState) -> int:
     """List the backend's tools and register them in place of any it had.
 
     Raises when the backend can't be reached or doesn't answer within
-    DISCOVERY_TIMEOUT_S, recording why in state.last_error.
+    DISCOVERY_TIMEOUT_S, recording why in state.last_error; the tools it had
+    stay registered. Clients hear of the change only if the tools changed.
     """
     config, name = state.config, state.name
     started = time.monotonic()
     state.last_attempt = time.time()
     try:
         with anyio.fail_after(DISCOVERY_TIMEOUT_S):
-            async with _client_for(config, timeout=10) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = (await session.list_tools()).tools
+            tools = await _list_tools(state)
     except Exception as e:
         state.last_attempt_s = time.monotonic() - started
         state.last_error = _reason(e)
@@ -335,6 +358,7 @@ async def _discover(state: BackendState) -> int:
     async with _registry_lock:
         if _states.get(name) is not state:  # removed or replaced meanwhile
             return 0
+        before = [t.model_dump() for t in _backend_tools(name)]
         # Replace, never duplicate: reload and the retry can both discover it.
         _purge_tools(name)
         for tool in tools:
@@ -368,14 +392,70 @@ async def _discover(state: BackendState) -> int:
             )
             registered += 1
         state.status, state.tools, state.last_error = "ready", registered, None
+        changed = [t.model_dump() for t in _backend_tools(name)] != before
     logger.info(
-        "Discovered %d tool(s) from '%s' in %.1fs",
+        "Discovered %d tool(s) from '%s' in %.1fs%s",
         registered,
         name,
         state.last_attempt_s,
+        "" if changed else " (unchanged)",
     )
-    _tools_changed()
+    if changed:
+        _tools_changed()
     return registered
+
+
+async def _refresh(state: BackendState) -> dict:
+    """List a backend's tools again, without restarting the aggregator (#8).
+
+    For a backend restarted with new or changed tools. A pending one is
+    activated, as the retry would. If the backend doesn't answer, it keeps
+    the tools it had: being down doesn't take them out of the listing.
+    Returns what changed, or the error and how many tools were kept.
+    """
+    async with _registry_lock:
+        before = {t.name for t in _backend_tools(state.name)}
+    if state.status == "pending":
+        ok = await _activate(state)
+    else:
+        try:
+            await _discover(state)
+            ok = True
+        except Exception:
+            ok = False
+    async with _registry_lock:
+        after = {t.name for t in _backend_tools(state.name)}
+    if not ok:
+        return {"backend": state.name, "error": state.last_error, "tools": len(after)}
+    return {
+        "backend": state.name,
+        "tools": len(after),
+        "added": sorted(after - before),
+        "removed": sorted(before - after),
+    }
+
+
+def _refresh_soon(state: BackendState, why: str) -> None:
+    """Refresh in the background, logging the outcome."""
+
+    async def run():
+        result = await _refresh(state)
+        if "error" in result:
+            logger.warning(
+                "Refresh of '%s' (%s) failed: %s", state.name, why, result["error"]
+            )
+        elif result["added"] or result["removed"]:
+            logger.info(
+                "Refresh of '%s' (%s): added %s, removed %s",
+                state.name,
+                why,
+                result["added"] or "none",
+                result["removed"] or "none",
+            )
+
+    task = asyncio.create_task(run())
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 async def _activate(state: BackendState) -> bool:
@@ -512,23 +592,75 @@ async def _retry_pending_backends() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _shutdown_or(event: asyncio.Event) -> bool:
+    """Wait for shutdown or event; True if it was shutdown."""
+    waits = [
+        asyncio.ensure_future(_shutdown_event.wait()),
+        asyncio.ensure_future(event.wait()),
+    ]
+    try:
+        await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waits:
+            w.cancel()
+    return _shutdown_event.is_set()
+
+
+def _session_lost(e: BaseException) -> bool:
+    """The backend refused the request because it doesn't know the session:
+    it restarted. It refuses before running anything, so a retry is safe."""
+    return (
+        isinstance(e, MCPError)
+        and e.code == types.INVALID_REQUEST
+        and e.message
+        in (
+            "Session not found",  # an mcp server's answer
+            "Session terminated",  # the client's name for a bare 404
+        )
+    )
+
+
 async def _run_persistent_pool(state: BackendState) -> None:
     """Keep one persistent ClientSession open for a pooled backend.
 
     Reconnects automatically on drop (HTTP) or respawns the subprocess
     (stdio). Exits when cancelled or when _shutdown_event fires.
+
+    The backend's tools are listed again after a reconnect, since a dropped
+    session usually means the backend restarted, and whenever the backend
+    sends notifications/tools/list_changed (#8). Discovery listed them just
+    before the first connection.
     """
+
+    async def on_message(message) -> None:
+        # Runs in the session's receive loop: awaiting a request here would
+        # wait on the loop itself, so the refresh runs as its own task.
+        if isinstance(message, types.ToolListChangedNotification):
+            _refresh_soon(state, "the backend's tool list changed")
+
     backoff = 2.0
+    connected_before = False
     while True:
         try:
             async with _client_for(state.config) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(
+                    read, write, message_handler=on_message
+                ) as session:
                     await session.initialize()
                     state.session = session
                     state.session_ready.set()
                     logger.info("Pool ready: '%s' (%s)", state.name, state.transport)
-                    await _shutdown_event.wait()
-                    return
+                    if connected_before:
+                        _refresh_soon(state, "reconnected")
+                    connected_before = True
+                    if await _shutdown_or(state.reconnect):
+                        return
+                    state.reconnect.clear()
+                    logger.info(
+                        "Pool '%s': the backend lost the session; reconnecting",
+                        state.name,
+                    )
+                    continue  # at once: the backend is up, it restarted
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -613,17 +745,28 @@ async def _proxy_call(prefixed_name: str, arguments: dict) -> types.CallToolResu
         # Never a one-off connection: a stdio backend's state (e.g. what a
         # "connect" tool set up) lives in its pooled process.
         state = _states.get(entry.backend_name)
-        if state is not None and state.session is None:
-            with anyio.move_on_after(POOL_WAIT_S):
-                await state.session_ready.wait()
-        session = state.session if state is not None else None
-        if session is None:
-            raise RuntimeError(
-                f"backend '{entry.backend_name}' is reconnecting; try again shortly"
-            )
-        return await session.call_tool(
-            entry.original_name, merged, read_timeout_seconds=CALL_TIMEOUT_S
-        )
+        for attempt in (1, 2):
+            if state is not None and state.session is None:
+                with anyio.move_on_after(POOL_WAIT_S):
+                    await state.session_ready.wait()
+            session = state.session if state is not None else None
+            if session is None:
+                raise RuntimeError(
+                    f"backend '{entry.backend_name}' is reconnecting; try again shortly"
+                )
+            try:
+                return await session.call_tool(
+                    entry.original_name, merged, read_timeout_seconds=CALL_TIMEOUT_S
+                )
+            except MCPError as e:
+                # A restarted backend: without this, every call failed with
+                # "Session not found" until the aggregator restarted (#8).
+                if not _session_lost(e) or attempt == 2:
+                    raise
+                if state.session is session:
+                    state.session = None
+                    state.session_ready.clear()
+                    state.reconnect.set()
 
     async with _make_client(
         entry.transport,
@@ -803,6 +946,22 @@ async def handle_remove_backend(request: Request) -> JSONResponse:
     removed = await _remove(name)
     logger.info("Management: removed backend '%s' (%d tools)", name, removed)
     return JSONResponse({"removed": removed})
+
+
+async def handle_refresh_backend(request: Request) -> JSONResponse:
+    name = request.path_params["name"]
+    state = _states.get(name)
+    if state is None:
+        return JSONResponse({"error": f"Backend '{name}' not found"}, status_code=404)
+    result = await _refresh(state)
+    logger.info("Management: refreshed backend '%s': %s", name, result)
+    return JSONResponse(result, status_code=502 if "error" in result else 200)
+
+
+async def handle_refresh_all(request: Request) -> JSONResponse:
+    results = await asyncio.gather(*(_refresh(s) for s in list(_states.values())))
+    logger.info("Management: refreshed all backends: %s", results)
+    return JSONResponse({"backends": results, "total_tools": len(_tool_registry)})
 
 
 async def handle_reload_backends(request: Request) -> JSONResponse:
@@ -990,6 +1149,12 @@ def build_starlette_app(server: Server) -> Starlette:
             # Management API — /backends/reload must come before /backends/{name}
             Route(
                 "/backends/reload", endpoint=handle_reload_backends, methods=["POST"]
+            ),
+            Route("/backends/refresh", endpoint=handle_refresh_all, methods=["POST"]),
+            Route(
+                "/backends/{name}/refresh",
+                endpoint=handle_refresh_backend,
+                methods=["POST"],
             ),
             Route(
                 "/backends/{name}", endpoint=handle_remove_backend, methods=["DELETE"]
