@@ -37,7 +37,15 @@ class Backend:
     def start(self, *flags: str) -> None:
         arg = "sse" if self.transport == "sse" else "streamable-http"
         self.proc = subprocess.Popen(
-            [sys.executable, str(FIXTURE), "--transport", arg, "--port", str(self.port), *flags],
+            [
+                sys.executable,
+                str(FIXTURE),
+                "--transport",
+                arg,
+                "--port",
+                str(self.port),
+                *flags,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -62,8 +70,13 @@ async def _post(path: str):
     """POST to a refresh route. TestClient would run the handler in a loop
     of its own; the aggregator's state lives in this one."""
     name = path.split("/")[2] if path.count("/") == 3 else None
-    scope = {"type": "http", "method": "POST", "path": path, "headers": [],
-             "path_params": {"name": name} if name else {}}
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [],
+        "path_params": {"name": name} if name else {},
+    }
     handler = agg.handle_refresh_backend if name else agg.handle_refresh_all
     response = await handler(Request(scope))
     return response.status_code, json.loads(response.body)
@@ -80,9 +93,16 @@ async def test_a_restarted_backends_new_tool_appears_on_refresh(backend):
     backend.start("--extra")
     status, body = await _post("/backends/live/refresh")
     assert status == 200
-    assert body == {"backend": "live", "tools": 3, "added": ["live__extra"], "removed": []}
+    assert body == {
+        "backend": "live",
+        "tools": 3,
+        "added": ["live__extra"],
+        "removed": [],
+    }
     assert "live__extra" in _names()
-    result = await agg._handle_call_tool(None, agg.types.CallToolRequestParams(name="live__extra"))
+    result = await agg._handle_call_tool(
+        None, agg.types.CallToolRequestParams(name="live__extra")
+    )
     assert not result.is_error
 
 
@@ -118,7 +138,9 @@ async def test_refresh_all_and_an_unknown_backend(backend):
     await connect(backend.config)
     status, body = await _post("/backends/refresh")
     assert status == 200 and body["total_tools"] == 2
-    assert body["backends"] == [{"backend": "live", "tools": 2, "added": [], "removed": []}]
+    assert body["backends"] == [
+        {"backend": "live", "tools": 2, "added": [], "removed": []}
+    ]
     status, body = await _post("/backends/nope/refresh")
     assert status == 404
 

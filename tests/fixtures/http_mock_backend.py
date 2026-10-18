@@ -47,8 +47,12 @@ if __name__ == "__main__":
         "--transport", choices=["sse", "streamable-http"], required=True
     )
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--extra", action="store_true", help="start with the extra tool")
-    parser.add_argument("--grow", action="store_true", help="offer grow, which adds it later")
+    parser.add_argument(
+        "--extra", action="store_true", help="start with the extra tool"
+    )
+    parser.add_argument(
+        "--grow", action="store_true", help="offer grow, which adds it later"
+    )
     args = parser.parse_args()
     if args.extra:
         mcp.add_tool(extra)

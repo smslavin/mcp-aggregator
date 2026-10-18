@@ -441,11 +441,16 @@ def _refresh_soon(state: BackendState, why: str) -> None:
     async def run():
         result = await _refresh(state)
         if "error" in result:
-            logger.warning("Refresh of '%s' (%s) failed: %s", state.name, why, result["error"])
+            logger.warning(
+                "Refresh of '%s' (%s) failed: %s", state.name, why, result["error"]
+            )
         elif result["added"] or result["removed"]:
             logger.info(
                 "Refresh of '%s' (%s): added %s, removed %s",
-                state.name, why, result["added"] or "none", result["removed"] or "none",
+                state.name,
+                why,
+                result["added"] or "none",
+                result["removed"] or "none",
             )
 
     task = asyncio.create_task(run())
@@ -589,7 +594,10 @@ async def _retry_pending_backends() -> None:
 
 async def _shutdown_or(event: asyncio.Event) -> bool:
     """Wait for shutdown or event; True if it was shutdown."""
-    waits = [asyncio.ensure_future(_shutdown_event.wait()), asyncio.ensure_future(event.wait())]
+    waits = [
+        asyncio.ensure_future(_shutdown_event.wait()),
+        asyncio.ensure_future(event.wait()),
+    ]
     try:
         await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -601,9 +609,14 @@ async def _shutdown_or(event: asyncio.Event) -> bool:
 def _session_lost(e: BaseException) -> bool:
     """The backend refused the request because it doesn't know the session:
     it restarted. It refuses before running anything, so a retry is safe."""
-    return isinstance(e, MCPError) and e.code == types.INVALID_REQUEST and e.message in (
-        "Session not found",  # an mcp server's answer
-        "Session terminated",  # the client's name for a bare 404
+    return (
+        isinstance(e, MCPError)
+        and e.code == types.INVALID_REQUEST
+        and e.message
+        in (
+            "Session not found",  # an mcp server's answer
+            "Session terminated",  # the client's name for a bare 404
+        )
     )
 
 
@@ -630,7 +643,9 @@ async def _run_persistent_pool(state: BackendState) -> None:
     while True:
         try:
             async with _client_for(state.config) as (read, write):
-                async with ClientSession(read, write, message_handler=on_message) as session:
+                async with ClientSession(
+                    read, write, message_handler=on_message
+                ) as session:
                     await session.initialize()
                     state.session = session
                     state.session_ready.set()
@@ -641,7 +656,10 @@ async def _run_persistent_pool(state: BackendState) -> None:
                     if await _shutdown_or(state.reconnect):
                         return
                     state.reconnect.clear()
-                    logger.info("Pool '%s': the backend lost the session; reconnecting", state.name)
+                    logger.info(
+                        "Pool '%s': the backend lost the session; reconnecting",
+                        state.name,
+                    )
                     continue  # at once: the backend is up, it restarted
         except asyncio.CancelledError:
             return
